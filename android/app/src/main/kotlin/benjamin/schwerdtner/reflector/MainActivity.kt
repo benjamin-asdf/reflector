@@ -1,4 +1,4 @@
-package com.reflector.reflector
+package benjamin.schwerdtner.reflector
 
 import io.flutter.embedding.android.FlutterActivity
 

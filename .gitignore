@@ -61,3 +61,8 @@ build/
 *.apk
 *.aab
 *.ipa
+
+# Signing
+android/key.properties
+*.jks
+*.keystore
