@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- Dark background -->
+  <rect width="1024" height="1024" fill="#0a0a0a"/>
+
+  <!-- 3x3 grid of rounded rects with wobble offsets, like the visualizer -->
+  <!-- Each cell ~240px with ~32px gap, grid centered in 1024 -->
+  <!-- Base grid origin: 104, 104 -->
+
+  <!-- Row 0 -->
+  <rect x="110" y="98" width="232" height="232" rx="18" ry="18"
+        fill="hsl(260, 80%, 52%)" stroke="hsl(80, 80%, 26%)" stroke-width="10"/>
+  <rect x="392" y="108" width="232" height="232" rx="18" ry="18"
+        fill="hsl(280, 75%, 48%)" stroke="hsl(100, 75%, 24%)" stroke-width="10"/>
+  <rect x="660" y="94" width="232" height="232" rx="18" ry="18"
+        fill="hsl(250, 85%, 56%)" stroke="hsl(70, 85%, 28%)" stroke-width="10"/>
+
+  <!-- Row 1 -->
+  <rect x="100" y="378" width="232" height="232" rx="18" ry="18"
+        fill="hsl(290, 78%, 50%)" stroke="hsl(110, 78%, 25%)" stroke-width="10"/>
+  <rect x="382" y="388" width="232" height="232" rx="18" ry="18"
+        fill="hsl(270, 82%, 55%)" stroke="hsl(90, 82%, 28%)" stroke-width="10"/>
+  <rect x="668" y="372" width="232" height="232" rx="18" ry="18"
+        fill="hsl(245, 76%, 50%)" stroke="hsl(65, 76%, 25%)" stroke-width="10"/>
+
+  <!-- Row 2 -->
+  <rect x="116" y="654" width="232" height="232" rx="18" ry="18"
+        fill="hsl(275, 80%, 53%)" stroke="hsl(95, 80%, 27%)" stroke-width="10"/>
+  <rect x="396" y="664" width="232" height="232" rx="18" ry="18"
+        fill="hsl(255, 84%, 49%)" stroke="hsl(75, 84%, 25%)" stroke-width="10"/>
+  <rect x="656" y="648" width="232" height="232" rx="18" ry="18"
+        fill="hsl(285, 77%, 54%)" stroke="hsl(105, 77%, 27%)" stroke-width="10"/>
+</svg>

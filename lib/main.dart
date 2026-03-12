@@ -20,6 +20,7 @@ class ReflectorApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return const MaterialApp(
       title: 'Reflector',
+      debugShowCheckedModeBanner: false,
       home: AccelerometerColorScreen(),
     );
   }
@@ -108,19 +109,29 @@ class AudioAnalyzer {
 class _TapRipple {
   final int col;
   final int row;
+  final double? hue;      // null = no color override, uses existing; set = audio color ripple
+  final double force;     // physics push strength
+  final double maxRadius; // how far the ripple travels (inf = full grid)
   double phase = 0;
-  _TapRipple({required this.col, required this.row});
+  _TapRipple({required this.col, required this.row, this.hue, this.force = 5.0, this.maxRadius = double.infinity});
 }
+
+enum _WavePattern { radial, snake, grow, tetris, spiral, shockwave, rain, cross }
 
 class _AudioWave {
   double phase = 0;
   final double intensity;
   final double hue;
-  final double speed;       // how fast the ring expands
+  final double speed;       // how fast the pattern advances
   final double beatForce;   // radial push strength
   final double originR;     // wave origin row (fractional)
   final double originC;     // wave origin col (fractional)
-  _AudioWave({required this.intensity, required this.hue, required this.speed, required this.beatForce, required this.originR, required this.originC});
+  final _WavePattern pattern;
+  final int seed;           // for deterministic pattern shapes
+  final List<List<int>>? path; // precomputed path for snake/tetris
+  final bool beatSynced;    // if true, only advances on beat
+  int beatStep = 0;         // how many beats have advanced this pattern
+  _AudioWave({required this.intensity, required this.hue, required this.speed, required this.beatForce, required this.originR, required this.originC, required this.pattern, this.seed = 0, this.path, this.beatSynced = false});
 }
 
 class AccelerometerColorScreen extends StatefulWidget {
@@ -158,11 +169,15 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
   bool _micStarted = false;
   final List<_AudioWave> _audioWaves = [];
   double _prevRms = 0; // for beat detection (rising edge)
+  int _lastRippleMs = 0; // cooldown for audio ripple spawning
   final List<double> _prevBandEnergy = List.filled(8, 0.0);
 
   // Extra off-screen margin so cells can flow in from edges
   static const int _extraCols = 2;
   static const int _extraRows = 2;
+
+  // Beat flash — global brightness/scale pulse on bass hits
+  double _beatFlash = 0; // 0-1, decays each frame
 
   // Shake physics — global offset from accelerometer + audio, cells respond with inertia
   double _shakeVx = 0;
@@ -173,10 +188,10 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
   List<double> _cellVelY = [];
   List<double> _beatForceX = [];  // per-cell beat impulse
   List<double> _beatForceY = [];
-  static const double _springK = 0.10;   // stiffer spring — snaps back faster
-  static const double _damping = 0.75;   // more friction — less wobble
-  static const double _inertiaScale = 0.75; // halved accelerometer push
-  List<double> _cellMass = [];             // random per-cell mass
+  static const double _springK = 0.3; 
+  static const double _damping = 0.1;   // more friction — less wobble
+  static const double _inertiaScale = 0.75;
+  List<double> _cellMass = [];             
 
   // Grid — includes extra off-screen margin
   static const int _visibleCols = 8;
@@ -190,7 +205,8 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
   List<double> _glow = [];
   List<double> _glowTarget = []; // desired glow — _glow eases toward this
   List<double> _glowNext = [];
-  List<double> _audioHue = [];    // per-cell hue from audio
+  List<double> _audioHue = [];    // per-cell current displayed hue
+  List<double> _audioHueTarget = []; // per-cell target hue (inertial)
   List<double> _audioHueNext = [];
   List<double> _hueOffsets = [];
   List<double> _brightOffsets = [];
@@ -227,7 +243,7 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
 
   // Idle patterns
   int _idleTicks = 0; // ticks since last audio trigger
-  static const int _idleThreshold = 120; // ~2 seconds at 60fps
+  static const int _idleThreshold = 60; // ~1 second at 60fps
   int _currentPattern = 0;
   double _patternPhase = 0;
   static const int _patternCount = 5;
@@ -340,6 +356,7 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
     _glowTarget = List.filled(total, 0.0);
     _glowNext = List.filled(total, 0.0);
     _audioHue = List.filled(total, 0.0);
+    _audioHueTarget = List.filled(total, 0.0);
     _audioHueNext = List.filled(total, 0.0);
     _hueOffsets = List.generate(total, (_) => colorRng.nextDouble() * 60 - 30);
     _brightOffsets =
@@ -354,7 +371,7 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
     _cellVelY = List.filled(total, 0.0);
     _beatForceX = List.filled(total, 0.0);
     _beatForceY = List.filled(total, 0.0);
-    _cellMass = List.generate(total, (_) => colorRng.nextDouble() * 20.0 + 80.0);
+    _cellMass = List.generate(total, (_) => colorRng.nextDouble() * 20.0 + 200.0 );
 
     // Back layer
     final backRng = Random(_colorSeed + 1);
@@ -502,7 +519,7 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
     if (!_gridInitialized) return;
 
     final rms = _analyzer.rms;
-    if (rms < 0.0005) return; // very low silence threshold
+    if (rms < 0.003) return; // silence threshold
 
     _idleTicks = 0; // reset idle
 
@@ -520,36 +537,104 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
 
     final loudness = (rms * 50).clamp(0.0, 1.0);
 
-    // Per-band wave spawning: each band spawns a wave from a different
-    // origin point. Bands are spread around the grid edge so different
-    // pitches activate different cells.
+    // Per-band: pick a rect deterministically from frequency, spawn a pattern from it
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    final canSpawnRipple = nowMs - _lastRippleMs >= 120;
+    final quietBoost = rms < 0.015 ? 6.0 : (rms < 0.03 ? 4.0 : (rms < 0.06 ? 2.0 : 1.0));
+
     for (var b = 0; b < 8; b++) {
       final energy = _analyzer.bandEnergy(b);
-      if (energy < 0.00005) continue;
-      // Lower threshold for bass bands so beats punch through
-      final risingThreshold = b < 2 ? 0.90 : 1.02;
-      if (energy <= _prevBandEnergy[b] * risingThreshold) continue;
+      if (energy < 0.000005) continue;
+      if (energy <= _prevBandEnergy[b] * 0.90) continue;
 
-      // Bass boost: low bands (kicks/beats) get extra intensity & force
-      final bassBoost = b < 2 ? 3.0 : (b < 4 ? 1.5 : 1.0);
-      final bandLoudness = sqrt((energy * 60 * bassBoost).clamp(0.0, 1.0));
-      final speed = 0.12 + (b / 7.0) * 0.28;
-      final force = sqrt((energy * 40 * bassBoost).clamp(0.0, 3.0));
+      final bandLoudness = sqrt((energy * 80 * quietBoost).clamp(0.0, 1.0));
+      final speed = 0.15 + (b / 7.0) * 0.2;
+      final force = sqrt((energy * 100 * quietBoost).clamp(0.0, 4.0));
       final bandHue = (soundHue + b * 30) % 360;
 
-      // Place wave origin: biased toward center, with band-dependent spread
-      final angle = b / 8.0 * 2 * pi - pi / 2;
-      final spread = 0.3; // 0 = always center, 1 = always perimeter
-      final originR = _rows / 2.0 + sin(angle) * _rows / 2.0 * spread;
-      final originC = _cols / 2.0 + cos(angle) * _cols / 2.0 * spread;
+      // --- Origin selection: varies by band character ---
+      int originC, originR;
+      final waveSeed = nowMs + b;
+      final patRng = Random(waveSeed);
+      final transientRatio = _prevBandEnergy[b] > 0.00001
+          ? energy / _prevBandEnergy[b]
+          : 10.0;
+
+      if (transientRatio > 5.0) {
+        // Sharp transient: random position for surprise
+        originC = patRng.nextInt(_cols);
+        originR = patRng.nextInt(_rows);
+      } else if (b >= 6) {
+        // High freq: edges and corners — shimmer from the periphery
+        final edge = patRng.nextInt(4);
+        originC = edge < 2 ? (edge == 0 ? 0 : _cols - 1) : patRng.nextInt(_cols);
+        originR = edge >= 2 ? (edge == 2 ? 0 : _rows - 1) : patRng.nextInt(_rows);
+      } else {
+        // Mid bands: original mapping — band selects column, energy selects row
+        originC = ((b / 7.0) * (_cols - 1)).round().clamp(0, _cols - 1);
+        originR = ((energy * 5000).clamp(0.0, 1.0) * (_rows - 1)).round().clamp(0, _rows - 1);
+      }
+      originC = originC.clamp(0, _cols - 1);
+      originR = originR.clamp(0, _rows - 1);
+
+      // Loud band triggers border pulse (no cooldown)
+      if (bandLoudness > 0.6) {
+        _beatFlash = max(_beatFlash, bandLoudness.clamp(0.5, 1.0));
+      }
+
+      // Cooldown: only spawn ripples/patterns every 120ms
+      if (!canSpawnRipple) continue;
+
+      // Light up the origin square and ripple outward from it
+      final originIdx = originR * _cols + originC;
+      if (originIdx >= 0 && originIdx < _glowTarget.length) {
+        _glowTarget[originIdx] = max(_glowTarget[originIdx], bandLoudness);
+        _audioHueTarget[originIdx] = bandHue;
+      }
+      // Softer sounds ripple fewer cells
+      final maxRad = 3.0 + bandLoudness * (_rows + _cols) * 0.5;
+      _tapRipples.add(_TapRipple(col: originC, row: originR, hue: bandHue, force: 3.0, maxRadius: maxRad));
+      _lastRippleMs = nowMs;
+
+      // --- Pattern selection: audio-reactive, not just random ---
+      _WavePattern pattern;
+      double patternForce = force;
+      double patternSpeed = speed;
+
+      if (transientRatio > 5.0) {
+        // Sharp transient (any band): explosive grow or shockwave
+        pattern = patRng.nextBool() ? _WavePattern.grow : _WavePattern.shockwave;
+        patternForce = force * 1.0;
+        patternSpeed = speed * 1.4;
+      } else if (b >= 6) {
+        // High freq: rain or spiral — delicate, fast
+        pattern = patRng.nextBool() ? _WavePattern.rain : _WavePattern.spiral;
+        patternForce = force * 0.4;
+        patternSpeed = speed * 1.6;
+      } else if (b >= 4) {
+        // Upper mids: spiral or snake — flowing motion
+        pattern = patRng.nextBool() ? _WavePattern.spiral : _WavePattern.snake;
+        patternForce = force * 0.7;
+        patternSpeed = speed * 1.2;
+      } else {
+        // Lower mids: tetris or grow — chunky, moderate push
+        final choices = [_WavePattern.tetris, _WavePattern.grow, _WavePattern.cross];
+        pattern = choices[patRng.nextInt(choices.length)];
+        patternForce = force * 0.8;
+      }
+
+      final path = _generatePath(pattern, originR, originC, patRng);
 
       _audioWaves.add(_AudioWave(
         intensity: bandLoudness,
         hue: bandHue,
-        speed: speed,
-        beatForce: force,
-        originR: originR,
-        originC: originC,
+        speed: patternSpeed,
+        beatForce: patternForce,
+        originR: originR.toDouble(),
+        originC: originC.toDouble(),
+        pattern: pattern,
+        seed: waveSeed,
+        path: path,
       ));
     }
 
@@ -699,6 +784,7 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
     if (!_gridInitialized) return;
     _tickCount++;
     _idleTicks++;
+    _beatFlash *= 0.85; // rapid decay — sharp pulse
 
     // Idle shimmer: soft ambient glow on small clusters, not single cells
     if (_tickCount % 12 == 0) {
@@ -774,6 +860,7 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
         // Propagate hue from brightest neighbor
         if (spread > _glow[idx]) {
           _audioHueNext[idx] = _audioHue[bestNeighbor];
+          _audioHueTarget[idx] = _audioHueTarget[bestNeighbor];
         } else {
           _audioHueNext[idx] = _audioHue[idx];
         }
@@ -788,12 +875,34 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
     _audioHue = _audioHueNext;
     _audioHueNext = tmpH;
 
+    // Hue inertia: lerp displayed hue toward target each frame
+    const hueInertia = 0.12; // 0 = frozen, 1 = instant snap
+    for (var i = 0; i < glowLen; i++) {
+      var diff = _audioHueTarget[i] - _audioHue[i];
+      // Shortest path around the 360 circle
+      if (diff > 180) diff -= 360;
+      if (diff < -180) diff += 360;
+      _audioHue[i] = (_audioHue[i] + diff * hueInertia) % 360;
+      if (_audioHue[i] < 0) _audioHue[i] += 360;
+    }
+
+    // Global shake from audio: sum beat forces to push the whole grid
+    double audioShakeX = 0, audioShakeY = 0;
+    for (var i = 0; i < glowLen; i++) {
+      audioShakeX += _beatForceX[i];
+      audioShakeY += _beatForceY[i];
+    }
+    // Normalize and scale — less force as requested
+    final audioShakeScale = 0.003;
+    _shakeVx += audioShakeX * audioShakeScale;
+    _shakeVy += audioShakeY * audioShakeScale;
+
     // Per-cell spring physics: accel + beat forces push, spring pulls back
     final totalShakeX = _shakeVx;
     final totalShakeY = _shakeVy;
     final glLen = _cellOffsetX.length;
-    const maxOffset = 80.0; // hard clamp to prevent runaway
-    const maxVel = 20.0;
+    const maxOffset = 60.0; // hard clamp to prevent runaway
+    const maxVel = 15.0;
 
     void _stepPhysics(
       List<double> offX, List<double> offY,
@@ -808,9 +917,10 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
         velY[i] += totalShakeY / mass;
         velX[i] += bfX[i] / mass;
         velY[i] += bfY[i] / mass;
-        bfX[i] *= 0.85;
-        bfY[i] *= 0.85;
-        final springMod = 0.9 + 0.1 * sin(_tickCount * 0.052 + springPhase);
+        bfX[i] *= 0.90;
+        bfY[i] *= 0.90;
+        final springMod = 1.0;
+        // 0.9 + 0.1 * sin(_tickCount * 0.052 + springPhase);
         final k = _springK * springMod;
         final dx = offX[i];
         final dy = offY[i];
@@ -881,8 +991,16 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
 
   void _advanceTapRipples() {
     final total = _glow.length;
+
+    // Track per-cell wave hits: sum of direction vectors weighted by strength
+    // When multiple waves overlap, the resultant force = dominant direction
+    final waveDirX = List<double>.filled(total, 0.0);
+    final waveDirY = List<double>.filled(total, 0.0);
+    final waveCount = List<int>.filled(total, 0);
+
     for (final ripple in _tapRipples) {
       ripple.phase += 0.18;
+      if (ripple.phase > ripple.maxRadius) continue; // stop expanding
       const intensity = 1.0;
       const waveWidth = 3.5;
 
@@ -897,11 +1015,237 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
           final wave = (1.0 - diff / waveWidth);
           final idx = r * _cols + c;
           if (idx >= 0 && idx < total) {
-            _glowTarget[idx] = max(_glowTarget[idx], wave * wave * intensity);
+            final strength = wave * wave * intensity;
+            _glowTarget[idx] = max(_glowTarget[idx], strength);
+            // Color ripple: audio ripples paint their hue onto cells
+            if (ripple.hue != null && strength > 0.1) {
+              _audioHueTarget[idx] = ripple.hue!;
+            }
 
-            // Radial force outward from tap point
+            // Accumulate wave direction per cell
             if (dist > 0.5) {
-              final force = wave * wave * 5.0;
+              final nx = dc / dist;
+              final ny = dr / dist;
+              waveDirX[idx] += nx * strength * ripple.force;
+              waveDirY[idx] += ny * strength * ripple.force;
+              waveCount[idx]++;
+            }
+          }
+        }
+      }
+    }
+
+    // Apply forces: cells with multiple wave hits get extra interference force
+    for (var i = 0; i < total; i++) {
+      final dx = waveDirX[i];
+      final dy = waveDirY[i];
+      _beatForceX[i] += dx;
+      _beatForceY[i] += dy;
+      _backBeatForceX[i] += dx;
+      _backBeatForceY[i] += dy;
+
+      // Interference boost: when 2+ waves meet, amplify the resultant force
+      if (waveCount[i] >= 2) {
+        final boost = 1.5;
+        final mag = sqrt(dx * dx + dy * dy);
+        if (mag > 0.01) {
+          _beatForceX[i] += dx / mag * mag * boost;
+          _beatForceY[i] += dy / mag * mag * boost;
+          _backBeatForceX[i] += dx / mag * mag * boost;
+          _backBeatForceY[i] += dy / mag * mag * boost;
+          // Also boost glow at interference points
+          _glowTarget[i] = min(1.0, _glowTarget[i] + 0.2 * waveCount[i]);
+        }
+      }
+    }
+
+    // Remove finished ripples
+    _tapRipples.removeWhere((r) => r.phase > min(r.maxRadius + 4, (_rows + _cols).toDouble()));
+  }
+
+  // Generate a path of [row, col] cells for pattern-based waves
+  List<List<int>> _generatePath(_WavePattern pattern, int startR, int startC, Random rng) {
+    final path = <List<int>>[];
+    var r = startR.clamp(0, _rows - 1);
+    var c = startC.clamp(0, _cols - 1);
+
+    switch (pattern) {
+      case _WavePattern.snake:
+        // Random walk that prefers a direction (glider-like diagonal movement)
+        final dirR = rng.nextBool() ? 1 : -1;
+        final dirC = rng.nextBool() ? 1 : -1;
+        for (var step = 0; step < 40; step++) {
+          path.add([r, c]);
+          // Glider-like: mostly diagonal, occasionally straight
+          if (rng.nextDouble() < 0.7) {
+            r += dirR;
+            c += dirC;
+          } else if (rng.nextBool()) {
+            r += dirR;
+          } else {
+            c += dirC;
+          }
+          r = r.clamp(0, _rows - 1);
+          c = c.clamp(0, _cols - 1);
+        }
+        break;
+
+      case _WavePattern.grow:
+        // Flood-fill like growth from center — BFS order
+        final visited = <int>{};
+        final queue = <List<int>>[[r, c]];
+        while (queue.isNotEmpty && path.length < 20) {
+          final idx = rng.nextInt(queue.length);
+          final cell = queue.removeAt(idx);
+          final key = cell[0] * _cols + cell[1];
+          if (visited.contains(key)) continue;
+          visited.add(key);
+          path.add(cell);
+          // Add neighbors in random order
+          for (final d in [[-1,0],[1,0],[0,-1],[0,1]]..shuffle(rng)) {
+            final nr = cell[0] + d[0];
+            final nc = cell[1] + d[1];
+            if (nr >= 0 && nr < _rows && nc >= 0 && nc < _cols) {
+              queue.add([nr, nc]);
+            }
+          }
+        }
+        break;
+
+      case _WavePattern.tetris:
+        // Small connected shapes (3-5 cells) that glide diagonally
+        // First generate a small tetromino-like shape
+        final shape = <List<int>>[[0, 0]];
+        for (var i = 0; i < 3 + rng.nextInt(3); i++) {
+          final base = shape[rng.nextInt(shape.length)];
+          final dirs = [[-1,0],[1,0],[0,-1],[0,1]];
+          final d = dirs[rng.nextInt(4)];
+          final nr = base[0] + d[0];
+          final nc = base[1] + d[1];
+          if (!shape.any((s) => s[0] == nr && s[1] == nc)) {
+            shape.add([nr, nc]);
+          }
+        }
+        // Now glide the shape diagonally across the grid
+        final dR = rng.nextBool() ? 1 : -1;
+        final dC = rng.nextBool() ? 1 : -1;
+        for (var step = 0; step < 30; step++) {
+          for (final s in shape) {
+            final pr = r + s[0];
+            final pc = c + s[1];
+            if (pr >= 0 && pr < _rows && pc >= 0 && pc < _cols) {
+              path.add([pr, pc]);
+            }
+          }
+          r += dR;
+          c += dC;
+          r = r.clamp(0, _rows - 1);
+          c = c.clamp(0, _cols - 1);
+        }
+        break;
+
+      case _WavePattern.spiral:
+        // Archimedean spiral outward from origin
+        for (var step = 0; step < 50; step++) {
+          final angle = step * 0.6;
+          final radius = step * 0.3;
+          final sr = startR + (sin(angle) * radius).round();
+          final sc = startC + (cos(angle) * radius).round();
+          if (sr >= 0 && sr < _rows && sc >= 0 && sc < _cols) {
+            path.add([sr, sc]);
+          }
+        }
+        break;
+
+      case _WavePattern.shockwave:
+        // Concentric diamond rings expanding outward (manhattan distance)
+        for (var ring = 0; ring < (_rows + _cols) ~/ 2; ring++) {
+          final cells = <List<int>>[];
+          for (var dr = -ring; dr <= ring; dr++) {
+            final dc = ring - dr.abs();
+            for (final d in [dc, -dc]) {
+              final sr = startR + dr;
+              final sc = startC + d;
+              if (sr >= 0 && sr < _rows && sc >= 0 && sc < _cols) {
+                cells.add([sr, sc]);
+              }
+            }
+          }
+          cells.shuffle(rng);
+          path.addAll(cells);
+        }
+        break;
+
+      case _WavePattern.rain:
+        // Vertical columns dropping down from origin row
+        final width = 2 + rng.nextInt(4);
+        final startCol = (startC - width ~/ 2).clamp(0, _cols - 1);
+        final endCol = (startC + width ~/ 2).clamp(0, _cols - 1);
+        for (var row = startR; row < _rows; row++) {
+          for (var col = startCol; col <= endCol; col++) {
+            path.add([row, col]);
+          }
+        }
+        // Wrap around top
+        for (var row = 0; row < startR; row++) {
+          for (var col = startCol; col <= endCol; col++) {
+            path.add([row, col]);
+          }
+        }
+        break;
+
+      case _WavePattern.cross:
+        // Expanding cross / plus pattern — arms grow simultaneously
+        for (var arm = 1; arm < (_rows + _cols) ~/ 2; arm++) {
+          for (final d in [
+            [arm, 0], [-arm, 0], [0, arm], [0, -arm], // cardinal
+            [arm, arm], [-arm, -arm], [arm, -arm], [-arm, arm], // diagonal
+          ]) {
+            final sr = startR + d[0];
+            final sc = startC + d[1];
+            if (sr >= 0 && sr < _rows && sc >= 0 && sc < _cols) {
+              path.add([sr, sc]);
+            }
+          }
+        }
+        break;
+
+      case _WavePattern.radial:
+        break; // radial doesn't use path
+    }
+    return path;
+  }
+
+  void _advanceAudioWaves() {
+    final total = _glow.length;
+    final maxDist = sqrt((_rows * _rows + _cols * _cols).toDouble());
+
+    for (final wave in _audioWaves) {
+      wave.phase += wave.speed;
+
+      if (wave.pattern == _WavePattern.radial) {
+        // Original expanding ring
+        const waveWidth = 2.5;
+        final or = wave.originR;
+        final oc = wave.originC;
+        for (var r = 0; r < _rows; r++) {
+          for (var c = 0; c < _cols; c++) {
+            final dr = r - or;
+            final dc = c - oc;
+            final dist = sqrt(dr * dr + dc * dc);
+            final diff = (wave.phase - dist).abs();
+            if (diff > waveWidth) continue;
+
+            final falloff = 1.0 - diff / waveWidth;
+            final v = falloff * falloff * wave.intensity;
+            final idx = r * _cols + c;
+            if (idx < 0 || idx >= total) continue;
+
+            if (v > _glowTarget[idx]) _audioHueTarget[idx] = wave.hue;
+            _glowTarget[idx] = max(_glowTarget[idx], v);
+
+            if (dist > 0.5 && wave.beatForce > 0) {
+              final force = wave.beatForce * falloff * falloff;
               final nx = dc / dist;
               final ny = dr / dist;
               _beatForceX[idx] += nx * force;
@@ -911,54 +1255,86 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
             }
           }
         }
-      }
-    }
-    // Remove finished ripples
-    _tapRipples.removeWhere((r) => r.phase > _rows + _cols);
-  }
+      } else if (wave.path != null) {
+        // Path-based patterns: light up cells along the path sequentially
+        final path = wave.path!;
+        // Beat-synced patterns advance via beatStep, others via phase
+        final headPos = wave.beatSynced ? wave.beatStep : (wave.phase * 3).floor();
+        const tailLen = 8; // how many cells stay lit behind the head
 
-  void _advanceAudioWaves() {
-    final total = _glow.length;
-    final maxDist = sqrt((_rows * _rows + _cols * _cols).toDouble());
-
-    for (final wave in _audioWaves) {
-      wave.phase += wave.speed;
-      const waveWidth = 2.5;
-      final or = wave.originR;
-      final oc = wave.originC;
-
-      for (var r = 0; r < _rows; r++) {
-        for (var c = 0; c < _cols; c++) {
-          final dr = r - or;
-          final dc = c - oc;
-          final dist = sqrt(dr * dr + dc * dc);
-          final diff = (wave.phase - dist).abs();
-          if (diff > waveWidth) continue;
-
-          final falloff = 1.0 - diff / waveWidth;
-          final v = falloff * falloff * wave.intensity;
+        for (var i = max(0, headPos - tailLen); i < min(headPos, path.length); i++) {
+          final cell = path[i];
+          final r = cell[0];
+          final c = cell[1];
+          if (r < 0 || r >= _rows || c < 0 || c >= _cols) continue;
           final idx = r * _cols + c;
           if (idx < 0 || idx >= total) continue;
 
-          if (v > _glowTarget[idx]) {
-            _audioHue[idx] = wave.hue;
-          }
+          // Fade: brightest at head, fading toward tail
+          final age = (headPos - i) / tailLen;
+          final v = wave.intensity * (1.0 - age) * (1.0 - age);
+
+          if (v > _glowTarget[idx]) _audioHueTarget[idx] = wave.hue;
           _glowTarget[idx] = max(_glowTarget[idx], v);
 
-          // Push cells away from wave origin
-          if (dist > 0.5 && wave.beatForce > 0) {
-            final force = wave.beatForce * falloff * falloff;
-            final nx = dc / dist;
-            final ny = dr / dist;
-            _beatForceX[idx] += nx * force;
-            _beatForceY[idx] += ny * force;
-            _backBeatForceX[idx] += nx * force;
-            _backBeatForceY[idx] += ny * force;
+          // Pattern-specific force behavior
+          if (wave.beatForce > 0) {
+            double fx = 0, fy = 0;
+            if (wave.pattern == _WavePattern.shockwave || wave.pattern == _WavePattern.cross) {
+              // Outward explosion from origin
+              final dr = r - wave.originR;
+              final dc = c - wave.originC;
+              final d = sqrt(dr * dr + dc * dc);
+              if (d > 0.3) {
+                final force = wave.beatForce * v * 0.4;
+                fx = dc / d * force;
+                fy = dr / d * force;
+              }
+            } else if (wave.pattern == _WavePattern.rain) {
+              // Downward gravity pull
+              final force = wave.beatForce * v * 0.25;
+              fy = force;
+              // Slight horizontal scatter
+              fx = (((idx * 7) % 5) - 2) * force * 0.1;
+            } else if (wave.pattern == _WavePattern.spiral) {
+              // Tangential swirl force (perpendicular to radius)
+              final dr = r - wave.originR;
+              final dc = c - wave.originC;
+              final d = sqrt(dr * dr + dc * dc);
+              if (d > 0.3) {
+                final force = wave.beatForce * v * 0.3;
+                // Perpendicular = rotate 90 degrees
+                fx = -dr / d * force;
+                fy = dc / d * force;
+              }
+            } else if (i + 1 < path.length) {
+              // Default: push in path direction (snake, tetris, grow)
+              final next = path[min(i + 1, path.length - 1)];
+              final dr = (next[0] - r).toDouble();
+              final dc = (next[1] - c).toDouble();
+              final d = sqrt(dr * dr + dc * dc);
+              if (d > 0.1) {
+                final force = wave.beatForce * v * 0.2;
+                fx = dc / d * force;
+                fy = dr / d * force;
+              }
+            }
+            _beatForceX[idx] += fx;
+            _beatForceY[idx] += fy;
+            _backBeatForceX[idx] += fx;
+            _backBeatForceY[idx] += fy;
           }
         }
       }
     }
-    _audioWaves.removeWhere((w) => w.phase > maxDist + 4);
+
+    // Remove finished waves
+    _audioWaves.removeWhere((w) {
+      if (w.pattern == _WavePattern.radial) return w.phase > maxDist + 4;
+      if (w.beatSynced && w.path != null) return w.beatStep > w.path!.length + 10;
+      if (w.path != null) return (w.phase * 3).floor() > w.path!.length + 8;
+      return w.phase > 30;
+    });
   }
 
   double _tiltHue() {
@@ -1027,6 +1403,7 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
                   backCellOffsetX: _backCellOffsetX,
                   backCellOffsetY: _backCellOffsetY,
                   tick: _tickCount,
+                  beatFlash: _beatFlash,
                 ),
               );
               },
@@ -1186,6 +1563,7 @@ class _GridPainter extends CustomPainter {
   final List<double> backCellOffsetX;
   final List<double> backCellOffsetY;
   final int tick;
+  final double beatFlash;
 
   _GridPainter({
     required this.cols,
@@ -1215,6 +1593,7 @@ class _GridPainter extends CustomPainter {
     required this.backCellOffsetX,
     required this.backCellOffsetY,
     required this.tick,
+    required this.beatFlash,
   });
 
   @override
@@ -1222,12 +1601,14 @@ class _GridPainter extends CustomPainter {
     final fillPaint = Paint()..style = PaintingStyle.fill;
     final borderPaint = Paint()
       ..style = PaintingStyle.stroke
-      ..strokeWidth = 10.0;
+      ..strokeWidth = 15.0;
 
     final t = tick * 0.015; // slower base time for supple motion
     const maxWobble = 0.8; // gentle idle sway
     const glowWobbleBoost = 2.0; // extra when glowing
     final radius = Radius.circular(cellSize * 0.08);
+    // Beat pulse: cells scale up slightly on beat
+    final beatScale = 1.0 + beatFlash * 0.08;
 
     final total = glow.length;
 
@@ -1285,7 +1666,7 @@ class _GridPainter extends CustomPainter {
         final physY = backCellOffsetY[idx];
         final originX = (c - extraCols) * cellSize + halfCell;
         final originY = (r - extraRows) * cellSize + halfCell;
-        final sz = (cellSize - 1.0) * backSizeJitter[idx];
+        final sz = (cellSize - 1.0) * backSizeJitter[idx] * beatScale;
         final pad = (cellSize - 1.0 - sz) / 2;
         final x = originX + pad + wobbleX + physX;
         final y = originY + pad + wobbleY + physY;
@@ -1298,6 +1679,7 @@ class _GridPainter extends CustomPainter {
         final borderHue = (hue + 180) % 360;
         final borderBright = (fillBright * 0.5).clamp(0.0, 1.0);
         borderPaint.color = HSVColor.fromAHSV(0.85, borderHue, fillSat, borderBright).toColor();
+
         canvas.drawRRect(rrect, borderPaint);
       }
     }
@@ -1349,7 +1731,7 @@ class _GridPainter extends CustomPainter {
         final physY = cellOffsetY[idx];
         final originX = (c - extraCols) * cellSize;
         final originY = (r - extraRows) * cellSize;
-        final sz = (cellSize - inset * 2) * sizeJitter[idx];
+        final sz = (cellSize - inset * 2) * sizeJitter[idx] * beatScale;
         final pad = (cellSize - inset * 2 - sz) / 2;
         final x = originX + inset + pad + wobbleX + physX;
         final y = originY + inset + pad + wobbleY + physY;
@@ -1362,10 +1744,11 @@ class _GridPainter extends CustomPainter {
         fillPaint.color = HSVColor.fromAHSV(1, blendedHue, fillSat, fillBright).toColor();
         canvas.drawRRect(rrect, fillPaint);
 
-        // Border — complementary to main tilt hue
+        // Border — complementary to main tilt hue, width scales with glow
         final borderHue = (hue + 180) % 360;
         final borderBright = (fillBright * 0.6).clamp(0.0, 1.0);
         borderPaint.color = HSVColor.fromAHSV(0.9, borderHue, fillSat, borderBright).toColor();
+
         canvas.drawRRect(rrect, borderPaint);
       }
     }
