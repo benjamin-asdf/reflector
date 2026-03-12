@@ -1,6 +1,3 @@
-import java.util.Properties
-import java.io.FileInputStream
-
 plugins {
     id("com.android.application")
     id("kotlin-android")
@@ -8,17 +5,7 @@ plugins {
     id("dev.flutter.flutter-gradle-plugin")
 }
 
-// Load key properties from file if present, fall back to environment variables
-val keystoreProperties = Properties()
-val keystorePropertiesFile = rootProject.file("key.properties")
-if (keystorePropertiesFile.exists()) {
-    keystoreProperties.load(FileInputStream(keystorePropertiesFile))
-} else {
-    keystoreProperties["storeFile"] = System.getenv("ANDROID_KEYSTORE_FILE") ?: ""
-    keystoreProperties["storePassword"] = System.getenv("ANDROID_KEYSTORE_PASSWORD") ?: ""
-    keystoreProperties["keyAlias"] = System.getenv("ANDROID_KEY_ALIAS") ?: ""
-    keystoreProperties["keyPassword"] = System.getenv("ANDROID_KEY_PASSWORD") ?: ""
-}
+val releasePassword = System.getenv("ANDROID_STORE_PASSWORD") ?: ""
 
 android {
     namespace = "benjamin.schwerdtner.reflector"
@@ -44,10 +31,10 @@ android {
 
     signingConfigs {
         create("release") {
-            keyAlias = keystoreProperties["keyAlias"] as String
-            keyPassword = keystoreProperties["keyPassword"] as String
-            storeFile = file(keystoreProperties["storeFile"] as String)
-            storePassword = keystoreProperties["storePassword"] as String
+            keyAlias = "upload"
+            keyPassword = releasePassword
+            storeFile = file(System.getProperty("user.home") + "/upload-keystore.jks")
+            storePassword = releasePassword
         }
     }
 
