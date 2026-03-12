@@ -242,8 +242,8 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
   int _tickCount = 0;
 
   // Idle patterns
-  int _idleTicks = 0; // ticks since last audio trigger
-  static const int _idleThreshold = 60; // ~1 second at 60fps
+  int _idleTicks = 0; // ticks since last input
+  static const int _idleThreshold = 150; // ~2.5 seconds at 60fps
   int _currentPattern = 0;
   double _patternPhase = 0;
   static const int _patternCount = 5;
@@ -412,9 +412,9 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
   }
 
   void _advanceColorSweep() {
-    _colorSweepPhase += 0.4;
+    _colorSweepPhase += 0.15; // slow ripple
     final maxDist = (_rows + _cols).toDouble();
-    if (_colorSweepPhase > maxDist + 4) {
+    if (_colorSweepPhase > maxDist + 6) {
       // Sweep finished — commit the new colors
       _colorSeed = _nextColorSeed;
       _hueAnchor = _nextHueAnchor;
@@ -424,8 +424,15 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
       return;
     }
 
+    // Gradually lerp hue anchor toward target
+    var anchorDiff = _nextHueAnchor - _hueAnchor;
+    if (anchorDiff > 180) anchorDiff -= 360;
+    if (anchorDiff < -180) anchorDiff += 360;
+    _hueAnchor = (_hueAnchor + anchorDiff * 0.02) % 360;
+    if (_hueAnchor < 0) _hueAnchor += 360;
+
     final phase = _colorSweepPhase;
-    const waveWidth = 3.0;
+    const waveWidth = 5.0; // wide transition zone
 
     for (var r = 0; r < _rows; r++) {
       for (var c = 0; c < _cols; c++) {
@@ -451,23 +458,22 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
             break;
         }
 
-        // Cells behind the wavefront get the new color
-        if (dist < phase - waveWidth) {
-          final idx = r * _cols + c;
-          _hueOffsets[idx] = _nextHueOffsets[idx];
-          _brightOffsets[idx] = _nextBrightOffsets[idx];
+        final idx = r * _cols + c;
+        // Blend zone: cells within the wavefront gradually transition
+        final progress = ((phase - dist) / waveWidth).clamp(0.0, 1.0);
+        if (progress > 0) {
+          final t = progress * progress; // ease-in for smooth blend
+          _hueOffsets[idx] += (_nextHueOffsets[idx] - _hueOffsets[idx]) * t * 0.05;
+          _brightOffsets[idx] += (_nextBrightOffsets[idx] - _brightOffsets[idx]) * t * 0.05;
         }
-        // Wavefront gets a glow
+        // Soft glow at the wavefront
         final diff = (phase - dist).abs();
         if (diff < waveWidth) {
           final wave = 1.0 - diff / waveWidth;
-          final idx = r * _cols + c;
-          _glowTarget[idx] = max(_glowTarget[idx], wave * wave * 0.6);
+          _glowTarget[idx] = max(_glowTarget[idx], wave * wave * 0.4);
         }
       }
     }
-    // Update anchor progressively
-    _hueAnchor = _nextHueAnchor;
   }
 
   String _micStatus = 'init';
@@ -521,7 +527,7 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
     final rms = _analyzer.rms;
     if (rms < 0.003) return; // silence threshold
 
-    _idleTicks = 0; // reset idle
+    _idleTicks = 0; // any sound above silence threshold resets idle
 
     // Spectral centroid for hue derivation (overall tonal color)
     double centroid = 0;
@@ -577,10 +583,6 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
       originC = originC.clamp(0, _cols - 1);
       originR = originR.clamp(0, _rows - 1);
 
-      // Loud band triggers border pulse (no cooldown)
-      if (bandLoudness > 0.6) {
-        _beatFlash = max(_beatFlash, bandLoudness.clamp(0.5, 1.0));
-      }
 
       // Cooldown: only spawn ripples/patterns every 120ms
       if (!canSpawnRipple) continue;
@@ -733,37 +735,41 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
     }
   }
 
+  double _idleHue = 0; // slowly drifting hue for idle ripples
+
+  int _lastIdleRippleMs = 0;
+
   void _applyIdlePattern() {
-    _patternPhase += 0.08; // fast sweep
+    _patternPhase += 0.03;
+    _idleHue = (_idleHue + 0.5) % 360;
     final maxDist = (_rows + _cols).toDouble();
-    if (_patternPhase > maxDist + 4) {
-      _patternPhase = -4.0;
+    if (_patternPhase > maxDist + 1) {
+      _patternPhase = -2.0;
       _currentPattern = (_currentPattern + 1) % _patternCount;
     }
 
     final phase = _patternPhase;
-    const intensity = 0.5;
-    const waveWidth = 3.5; // wide overlap so cells bunch together
+    const waveWidth = 5.0;
 
     for (var r = 0; r < _rows; r++) {
       for (var c = 0; c < _cols; c++) {
         double dist;
         switch (_currentPattern) {
-          case 0: // center outward
+          case 0:
             final cr = _rows / 2.0;
             final cc = _cols / 2.0;
             dist = sqrt((r - cr) * (r - cr) + (c - cc) * (c - cc));
             break;
-          case 1: // left to right
+          case 1:
             dist = c.toDouble();
             break;
-          case 2: // right to left
+          case 2:
             dist = (_cols - 1 - c).toDouble();
             break;
-          case 3: // diagonal top-left to bottom-right
+          case 3:
             dist = (r + c) * 0.7;
             break;
-          case 4: // diagonal bottom-right to top-left
+          case 4:
           default:
             dist = (_rows + _cols - 2 - r - c) * 0.7;
             break;
@@ -771,11 +777,29 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
 
         final diff = (phase - dist).abs();
         if (diff < waveWidth) {
-          // Smooth falloff with overlap
           final wave = (1.0 - diff / waveWidth);
+          final strength = wave * wave;
           final idx = r * _cols + c;
-          _glowTarget[idx] = max(_glowTarget[idx], wave * wave * intensity);
+          _glowTarget[idx] = max(_glowTarget[idx], strength * 0.7);
         }
+      }
+    }
+
+    // Spawn actual ripples frequently — same as audio/tap ripples
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    if (nowMs - _lastIdleRippleMs > 800) {
+      _lastIdleRippleMs = nowMs;
+      final rng = Random(nowMs);
+      final rc = rng.nextInt(_rows);
+      final cc = rng.nextInt(_cols);
+      _tapRipples.add(_TapRipple(
+        col: cc, row: rc, force: 0.3,
+        maxRadius: 4.0 + rng.nextDouble() * 6.0,
+      ));
+
+      // Occasionally trigger a full color sweep — new hue palette
+      if (!_colorSweepActive && rng.nextInt(8) == 0) {
+        _startColorSweep();
       }
     }
   }
@@ -786,22 +810,6 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
     _idleTicks++;
     _beatFlash *= 0.85; // rapid decay — sharp pulse
 
-    // Idle shimmer: soft ambient glow on small clusters, not single cells
-    if (_tickCount % 12 == 0) {
-      final r = _random.nextInt(_rows);
-      final c = _random.nextInt(_cols);
-      // Light a 2x2 area softly
-      for (var dr = 0; dr < 2; dr++) {
-        for (var dc = 0; dc < 2; dc++) {
-          final nr = r + dr;
-          final nc = c + dc;
-          if (nr < _rows && nc < _cols) {
-            final idx = nr * _cols + nc;
-            _glowTarget[idx] = max(_glowTarget[idx], 0.12);
-          }
-        }
-      }
-    }
 
     // Tap ripples
     _advanceTapRipples();
@@ -977,14 +985,40 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
 
   void _onTap(Offset position) {
     if (!_gridInitialized) return;
+    _idleTicks = 0;
     final cellSize = MediaQuery.of(context).size.width / _visibleCols;
-    // Convert screen position to grid coordinates (accounting for extra margin)
     final tapCol = (position.dx / cellSize).floor() + _extraCols;
     final tapRow = (position.dy / cellSize).floor() + _extraRows;
     if (tapCol < 0 || tapCol >= _cols || tapRow < 0 || tapRow >= _rows) return;
 
-    // Trigger expanding ripple from tap point
-    _tapRipples.add(_TapRipple(col: tapCol, row: tapRow));
+    // Big color ripple from tap
+    final tapHue = (_random.nextDouble() * 360);
+    _tapRipples.add(_TapRipple(
+      col: tapCol, row: tapRow, hue: tapHue, force: 3.0,
+      maxRadius: (_rows + _cols).toDouble(),
+    ));
+
+    // Also spawn an audio wave pattern for extra visual punch
+    final rng = Random(DateTime.now().millisecondsSinceEpoch);
+    final patterns = [_WavePattern.shockwave, _WavePattern.spiral, _WavePattern.cross];
+    final pattern = patterns[rng.nextInt(patterns.length)];
+    final path = _generatePath(pattern, tapRow, tapCol, rng);
+    _audioWaves.add(_AudioWave(
+      intensity: 0.8,
+      hue: tapHue,
+      speed: 0.2,
+      beatForce: 2.0,
+      originR: tapRow.toDouble(),
+      originC: tapCol.toDouble(),
+      pattern: pattern,
+      seed: rng.nextInt(99999),
+      path: path,
+    ));
+
+    // Trigger a color sweep on every other tap
+    if (!_colorSweepActive && rng.nextBool()) {
+      _startColorSweep();
+    }
   }
 
   final List<_TapRipple> _tapRipples = [];
@@ -1676,9 +1710,8 @@ class _GridPainter extends CustomPainter {
         fillPaint.color = HSVColor.fromAHSV(1, blendedHue, fillSat, fillBright).toColor();
         canvas.drawRRect(rrect, fillPaint);
 
-        final borderHue = (hue + 180) % 360;
-        final borderBright = (fillBright * 0.5).clamp(0.0, 1.0);
-        borderPaint.color = HSVColor.fromAHSV(0.85, borderHue, fillSat, borderBright).toColor();
+        final borderHue = (blendedHue + 180) % 360;
+        borderPaint.color = HSVColor.fromAHSV(0.2, borderHue, fillSat, fillBright).toColor();
 
         canvas.drawRRect(rrect, borderPaint);
       }
@@ -1744,10 +1777,8 @@ class _GridPainter extends CustomPainter {
         fillPaint.color = HSVColor.fromAHSV(1, blendedHue, fillSat, fillBright).toColor();
         canvas.drawRRect(rrect, fillPaint);
 
-        // Border — complementary to main tilt hue, width scales with glow
-        final borderHue = (hue + 180) % 360;
-        final borderBright = (fillBright * 0.6).clamp(0.0, 1.0);
-        borderPaint.color = HSVColor.fromAHSV(0.9, borderHue, fillSat, borderBright).toColor();
+        final borderHue = (blendedHue + 180) % 360;
+        borderPaint.color = HSVColor.fromAHSV(0.1, borderHue, fillSat, fillBright).toColor();
 
         canvas.drawRRect(rrect, borderPaint);
       }
