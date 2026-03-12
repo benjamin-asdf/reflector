@@ -36,7 +36,9 @@ dependencies:
   cupertino_icons: ^1.0.8
   sensors_plus: ^7.0.0
   permission_handler: ^12.0.1
-  flutter_audio_capture: ^1.1.12
+  flutter_audio_capture:
+    path: flutter_audio_capture_local
+  wakelock_plus: ^1.4.0
 
 dev_dependencies:
   flutter_test:

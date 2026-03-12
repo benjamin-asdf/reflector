@@ -7,6 +7,7 @@ import 'package:flutter/scheduler.dart';
 import 'package:flutter_audio_capture/flutter_audio_capture.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:sensors_plus/sensors_plus.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
 
 void main() {
   runApp(const ReflectorApp());
@@ -36,7 +37,7 @@ class AudioAnalyzer {
   // Smoothed band energies
   final Float64List _bandEnergies = Float64List(8);
   final Float64List _smoothedEnergies = Float64List(8);
-  static const double _smoothing = 0.5;
+  static const double _smoothing = 0.7; // faster response to transients
 
   // Overall loudness
   double rms = 0;
@@ -104,6 +105,24 @@ class AudioAnalyzer {
   double bandEnergy(int band) => _smoothedEnergies[band];
 }
 
+class _TapRipple {
+  final int col;
+  final int row;
+  double phase = 0;
+  _TapRipple({required this.col, required this.row});
+}
+
+class _AudioWave {
+  double phase = 0;
+  final double intensity;
+  final double hue;
+  final double speed;       // how fast the ring expands
+  final double beatForce;   // radial push strength
+  final double originR;     // wave origin row (fractional)
+  final double originC;     // wave origin col (fractional)
+  _AudioWave({required this.intensity, required this.hue, required this.speed, required this.beatForce, required this.originR, required this.originC});
+}
+
 class AccelerometerColorScreen extends StatefulWidget {
   const AccelerometerColorScreen({super.key});
 
@@ -120,11 +139,26 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
   double _z = 0;
   static const double _smoothing = 0.15;
   StreamSubscription<AccelerometerEvent>? _accelSub;
+  // Shake-to-shuffle: detect ~2-3cm traverse then reversal
+  static const double _displacementThreshold = 0.12; // meters (~12cm)
+  static const int _shakeWindowMs = 700;
+  static const int _shakeCooldownMs = 2000;
+  int _lastShakeShuffle = 0;
+  // Integrated linear velocity & displacement
+  double _linVx = 0, _linVy = 0;
+  double _dispX = 0, _dispY = 0;
+  // First stroke direction
+  double _strokeDx = 0, _strokeDy = 0;
+  int _strokeTime = 0;
+  bool _hasFirstStroke = false;
 
   // Audio
   final FlutterAudioCapture _audioCapture = FlutterAudioCapture();
   final AudioAnalyzer _analyzer = AudioAnalyzer();
   bool _micStarted = false;
+  final List<_AudioWave> _audioWaves = [];
+  double _prevRms = 0; // for beat detection (rising edge)
+  final List<double> _prevBandEnergy = List.filled(8, 0.0);
 
   // Extra off-screen margin so cells can flow in from edges
   static const int _extraCols = 2;
@@ -133,15 +167,15 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
   // Shake physics — global offset from accelerometer + audio, cells respond with inertia
   double _shakeVx = 0;
   double _shakeVy = 0;
-  double _audioShakeX = 0; // audio-driven shake impulse
-  double _audioShakeY = 0;
   List<double> _cellOffsetX = []; // per-cell current X displacement
   List<double> _cellOffsetY = [];
   List<double> _cellVelX = [];    // per-cell velocity
   List<double> _cellVelY = [];
-  static const double _springK = 0.03;   // softer spring (slower return)
-  static const double _damping = 0.2;    // less damping (more sloshing)
-  static const double _inertiaScale = 1.5; // stronger push from shake
+  List<double> _beatForceX = [];  // per-cell beat impulse
+  List<double> _beatForceY = [];
+  static const double _springK = 0.10;   // stiffer spring — snaps back faster
+  static const double _damping = 0.75;   // more friction — less wobble
+  static const double _inertiaScale = 0.75; // halved accelerometer push
   List<double> _cellMass = [];             // random per-cell mass
 
   // Grid — includes extra off-screen margin
@@ -150,8 +184,11 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
   int get _cols => _visibleCols + _extraCols * 2;
   int get _rows => _visibleRows + _extraRows * 2;
   int get _total => _cols * _rows;
-  final Random _random = Random();
+  int _colorSeed = 0;
+  double _hueAnchor = 300; // +300 = green at flat; changes on shuffle
+  Random _random = Random();
   List<double> _glow = [];
+  List<double> _glowTarget = []; // desired glow — _glow eases toward this
   List<double> _glowNext = [];
   List<double> _audioHue = [];    // per-cell hue from audio
   List<double> _audioHueNext = [];
@@ -160,11 +197,29 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
   List<double> _wobblePhaseX = []; // random per-cell wobble phase
   List<double> _wobblePhaseY = [];
   List<double> _wobbleSpeed = [];  // random per-cell wobble speed
+  List<double> _sizeJitter = []; // per-cell size variation
+
+  // Back layer — same grid, offset half a cell, drawn underneath
+  List<double> _backHueOffsets = [];
+  List<double> _backBrightOffsets = [];
+  List<double> _backWobblePhaseX = [];
+  List<double> _backWobblePhaseY = [];
+  List<double> _backWobbleSpeed = [];
+  List<double> _backSizeJitter = [];
+  List<double> _backCellOffsetX = [];
+  List<double> _backCellOffsetY = [];
+  List<double> _backCellVelX = [];
+  List<double> _backCellVelY = [];
+  List<double> _backCellMass = [];
+  List<double> _backBeatForceX = [];
+  List<double> _backBeatForceY = [];
   bool _gridInitialized = false;
 
   // Wave propagation
   static const double _spreadRate = 0.22;
   static const double _decayRate = 0.993;
+  // Max glow increase per tick — prevents sudden flashes
+  static const double _glowRiseRate = 0.07;
 
   // Animation
   late Ticker _ticker;
@@ -177,14 +232,33 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
   double _patternPhase = 0;
   static const int _patternCount = 5;
 
+  // Color sweep — wave that recolors cells as it passes
+  bool _colorSweepActive = false;
+  double _colorSweepPhase = 0;
+  int _colorSweepPattern = 0;
+  int _nextColorSeed = 0;
+  double _nextHueAnchor = 0;
+  List<double> _nextHueOffsets = [];
+  List<double> _nextBrightOffsets = [];
+
+  // Sound novelty detection — cache recent fingerprints
+  static const int _fpCacheSize = 5;
+  static const double _noveltyThreshold = 0.35; // euclidean distance to count as "new"
+  final List<List<double>> _recentFingerprints = [];
+  bool _noveltyPatternActive = false;
+  double _noveltyPatternPhase = 0;
+  int _noveltyPattern = 0;
+
   // Debug
   bool _showDebug = false;
 
   @override
   void initState() {
     super.initState();
+    WakelockPlus.enable();
 
-    _initGrid(_rows);
+    _colorSeed = DateTime.now().millisecondsSinceEpoch;
+    _initGrid(_visibleRows);
 
     // Accelerometer
     _accelSub = accelerometerEventStream(
@@ -193,6 +267,57 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
       // Shake velocity: raw accel minus smoothed (removes gravity)
       _shakeVx = (event.x - _x) * _inertiaScale;
       _shakeVy = (event.y - _y) * _inertiaScale;
+
+      // Integrate linear acceleration for displacement-based shake detection
+      const double dt = 0.05; // 50ms sampling
+      final linAx = event.x - _x; // linear accel (gravity removed)
+      final linAy = event.y - _y;
+      _linVx += linAx * dt;
+      _linVy += linAy * dt;
+      _dispX += _linVx * dt;
+      _dispY += _linVy * dt;
+
+      final dispMag = sqrt(_dispX * _dispX + _dispY * _dispY);
+      final now = DateTime.now().millisecondsSinceEpoch;
+
+      if (dispMag > _displacementThreshold) {
+        if (_hasFirstStroke) {
+          // Check if this stroke is roughly opposite to the first
+          final dot = _dispX * _strokeDx + _dispY * _strokeDy;
+          if (dot < 0 &&
+              now - _strokeTime < _shakeWindowMs &&
+              now - _lastShakeShuffle > _shakeCooldownMs) {
+            _lastShakeShuffle = now;
+            _colorSeed = now;
+            _hueAnchor = Random(_colorSeed).nextDouble() * 360;
+            _shuffleColors();
+            _hasFirstStroke = false;
+          } else {
+            // Replace with new first stroke
+            _strokeDx = _dispX;
+            _strokeDy = _dispY;
+            _strokeTime = now;
+          }
+        } else {
+          // Record first stroke
+          _strokeDx = _dispX;
+          _strokeDy = _dispY;
+          _strokeTime = now;
+          _hasFirstStroke = true;
+        }
+        // Reset integration after recording stroke
+        _linVx = 0; _linVy = 0;
+        _dispX = 0; _dispY = 0;
+      }
+
+      // Expire stale first stroke
+      if (_hasFirstStroke && now - _strokeTime > _shakeWindowMs) {
+        _hasFirstStroke = false;
+      }
+
+      // Decay velocity aggressively to fight drift
+      _linVx *= 0.8;
+      _linVy *= 0.8;
 
       _x += (event.x - _x) * _smoothing;
       _y += (event.y - _y) * _smoothing;
@@ -208,45 +333,167 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
   void _initGrid(int visibleRows) {
     _visibleRows = visibleRows;
     final total = _total;
+    // Seeded random for reproducible color palette
+    final colorRng = Random(_colorSeed);
+    _random = Random();
     _glow = List.filled(total, 0.0);
+    _glowTarget = List.filled(total, 0.0);
     _glowNext = List.filled(total, 0.0);
     _audioHue = List.filled(total, 0.0);
     _audioHueNext = List.filled(total, 0.0);
-    _hueOffsets = List.generate(total, (_) => _random.nextDouble() * 60 - 30);
+    _hueOffsets = List.generate(total, (_) => colorRng.nextDouble() * 60 - 30);
     _brightOffsets =
-        List.generate(total, (_) => _random.nextDouble() * 0.3 - 0.15);
+        List.generate(total, (_) => colorRng.nextDouble() * 0.3 - 0.15);
     _wobblePhaseX = List.generate(total, (_) => _random.nextDouble() * 2 * pi);
     _wobblePhaseY = List.generate(total, (_) => _random.nextDouble() * 2 * pi);
     _wobbleSpeed = List.generate(total, (_) => 0.3 + _random.nextDouble() * 0.7);
+    _sizeJitter = List.generate(total, (_) => 0.85 + colorRng.nextDouble() * 0.15);
     _cellOffsetX = List.filled(total, 0.0);
     _cellOffsetY = List.filled(total, 0.0);
     _cellVelX = List.filled(total, 0.0);
     _cellVelY = List.filled(total, 0.0);
-    _cellMass = List.generate(total, (_) => 0.5 + _random.nextDouble() * 1.5);
+    _beatForceX = List.filled(total, 0.0);
+    _beatForceY = List.filled(total, 0.0);
+    _cellMass = List.generate(total, (_) => colorRng.nextDouble() * 20.0 + 80.0);
+
+    // Back layer
+    final backRng = Random(_colorSeed + 1);
+    _backHueOffsets = List.generate(total, (_) => backRng.nextDouble() * 60 - 30);
+    _backBrightOffsets = List.generate(total, (_) => backRng.nextDouble() * 0.3 - 0.15);
+    _backWobblePhaseX = List.generate(total, (_) => _random.nextDouble() * 2 * pi);
+    _backWobblePhaseY = List.generate(total, (_) => _random.nextDouble() * 2 * pi);
+    _backWobbleSpeed = List.generate(total, (_) => 0.3 + _random.nextDouble() * 0.7);
+    _backSizeJitter = List.generate(total, (_) => 0.85 + backRng.nextDouble() * 0.15);
+    _backCellOffsetX = List.filled(total, 0.0);
+    _backCellOffsetY = List.filled(total, 0.0);
+    _backCellVelX = List.filled(total, 0.0);
+    _backCellVelY = List.filled(total, 0.0);
+    _backCellMass = List.generate(total, (_) => backRng.nextDouble() * 20.0 + 80.0);
+    _backBeatForceX = List.filled(total, 0.0);
+    _backBeatForceY = List.filled(total, 0.0);
     _gridInitialized = true;
   }
 
-  Future<void> _startMic() async {
-    final status = await Permission.microphone.request();
-    if (!status.isGranted) return;
-
-    await _audioCapture.start(
-      _onAudioData,
-      _onAudioError,
-      sampleRate: 44100,
-      bufferSize: 2048,
-    );
-    _micStarted = true;
+  void _shuffleColors() {
+    final total = _total;
+    final colorRng = Random(_colorSeed);
+    _hueOffsets = List.generate(total, (_) => colorRng.nextDouble() * 60 - 30);
+    _brightOffsets =
+        List.generate(total, (_) => colorRng.nextDouble() * 0.3 - 0.15);
   }
 
+  void _startColorSweep() {
+    _nextColorSeed = DateTime.now().millisecondsSinceEpoch;
+    _nextHueAnchor = Random(_nextColorSeed).nextDouble() * 360;
+    final total = _total;
+    final colorRng = Random(_nextColorSeed);
+    _nextHueOffsets = List.generate(total, (_) => colorRng.nextDouble() * 60 - 30);
+    _nextBrightOffsets = List.generate(total, (_) => colorRng.nextDouble() * 0.3 - 0.15);
+    _colorSweepActive = true;
+    _colorSweepPhase = -4.0;
+    _colorSweepPattern = _random.nextInt(_patternCount);
+  }
+
+  void _advanceColorSweep() {
+    _colorSweepPhase += 0.4;
+    final maxDist = (_rows + _cols).toDouble();
+    if (_colorSweepPhase > maxDist + 4) {
+      // Sweep finished — commit the new colors
+      _colorSeed = _nextColorSeed;
+      _hueAnchor = _nextHueAnchor;
+      _hueOffsets = _nextHueOffsets;
+      _brightOffsets = _nextBrightOffsets;
+      _colorSweepActive = false;
+      return;
+    }
+
+    final phase = _colorSweepPhase;
+    const waveWidth = 3.0;
+
+    for (var r = 0; r < _rows; r++) {
+      for (var c = 0; c < _cols; c++) {
+        double dist;
+        switch (_colorSweepPattern) {
+          case 0:
+            final cr = _rows / 2.0;
+            final cc = _cols / 2.0;
+            dist = sqrt((r - cr) * (r - cr) + (c - cc) * (c - cc));
+            break;
+          case 1:
+            dist = c.toDouble();
+            break;
+          case 2:
+            dist = (_cols - 1 - c).toDouble();
+            break;
+          case 3:
+            dist = (r + c) * 0.7;
+            break;
+          case 4:
+          default:
+            dist = (_rows + _cols - 2 - r - c) * 0.7;
+            break;
+        }
+
+        // Cells behind the wavefront get the new color
+        if (dist < phase - waveWidth) {
+          final idx = r * _cols + c;
+          _hueOffsets[idx] = _nextHueOffsets[idx];
+          _brightOffsets[idx] = _nextBrightOffsets[idx];
+        }
+        // Wavefront gets a glow
+        final diff = (phase - dist).abs();
+        if (diff < waveWidth) {
+          final wave = 1.0 - diff / waveWidth;
+          final idx = r * _cols + c;
+          _glowTarget[idx] = max(_glowTarget[idx], wave * wave * 0.6);
+        }
+      }
+    }
+    // Update anchor progressively
+    _hueAnchor = _nextHueAnchor;
+  }
+
+  String _micStatus = 'init';
+
+  Future<void> _startMic() async {
+    final status = await Permission.microphone.request();
+    if (!status.isGranted) {
+      _micStatus = 'denied: $status';
+      return;
+    }
+
+    try {
+      await _audioCapture.init();
+      await _audioCapture.start(
+        _onAudioData,
+        _onAudioError,
+        sampleRate: 44100,
+        bufferSize: 2048,
+      );
+      _micStarted = true;
+      _micStatus = 'started';
+    } catch (e) {
+      _micStatus = 'error: $e';
+    }
+  }
+
+  int _audioCallbackCount = 0;
+
   void _onAudioData(dynamic data) {
-    // flutter_audio_capture gives Float64List or List<double>
+    _audioCallbackCount++;
+
     List<double> samples;
     if (data is Float64List) {
       samples = data.toList();
     } else if (data is List) {
-      samples = data.cast<double>();
+      try {
+        samples = List<double>.from(data);
+      } catch (_) {
+        _micStatus = 'bad data: ${data.runtimeType}';
+        return;
+      }
     } else {
+      _micStatus = 'unknown type: ${data.runtimeType}';
       return;
     }
 
@@ -255,26 +502,11 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
     if (!_gridInitialized) return;
 
     final rms = _analyzer.rms;
-    if (rms < 0.002) return; // very low silence threshold
+    if (rms < 0.0005) return; // very low silence threshold
 
     _idleTicks = 0; // reset idle
 
-    // Loud sounds push cells like a shake
-    if (rms > 0.05) {
-      final shakeForce = (rms * 4).clamp(0.0, 3.0);
-      _audioShakeX += ((_random.nextDouble() - 0.5) * 2) * shakeForce;
-      _audioShakeY += ((_random.nextDouble() - 0.5) * 2) * shakeForce;
-    }
-
-    final fp = _analyzer.fingerprint;
-    final dominant = _analyzer.dominantBand;
-    final total = _glow.length;
-    if (total == 0) return;
-
-    final loudness = (rms * 8).clamp(0.0, 1.0);
-
-    // Derive a hue from the spectral shape:
-    // Spectral centroid maps to hue — bass=red, mid=green, treble=blue
+    // Spectral centroid for hue derivation (overall tonal color)
     double centroid = 0;
     double totalEnergy = 0;
     for (var b = 0; b < 8; b++) {
@@ -283,67 +515,137 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
       totalEnergy += e;
     }
     if (totalEnergy > 0) centroid /= totalEnergy;
-    // centroid is 0-7, map to hue 0-360
+    // Hue from spectral centroid — overall sound color
     final soundHue = (centroid / 7.0 * 360) % 360;
 
-    // Center of the grid
-    final cr = _rows / 2.0;
-    final cc = _cols / 2.0;
-    final maxDist = sqrt(cr * cr + cc * cc);
+    final loudness = (rms * 50).clamp(0.0, 1.0);
 
-    // Each band maps to a ring distance from center:
-    // low frequencies = center, high frequencies = outer edge
-    // Same sound spectrum = same ring pattern
-    for (var band = 0; band < 8; band++) {
-      final energy = _analyzer.bandEnergy(band);
-      if (energy < 0.001) continue;
+    // Per-band wave spawning: each band spawns a wave from a different
+    // origin point. Bands are spread around the grid edge so different
+    // pitches activate different cells.
+    for (var b = 0; b < 8; b++) {
+      final energy = _analyzer.bandEnergy(b);
+      if (energy < 0.00005) continue;
+      // Lower threshold for bass bands so beats punch through
+      final risingThreshold = b < 2 ? 0.90 : 1.02;
+      if (energy <= _prevBandEnergy[b] * risingThreshold) continue;
 
-      final intensity = (energy * 60 * loudness).clamp(0.0, 1.0);
+      // Bass boost: low bands (kicks/beats) get extra intensity & force
+      final bassBoost = b < 2 ? 3.0 : (b < 4 ? 1.5 : 1.0);
+      final bandLoudness = sqrt((energy * 60 * bassBoost).clamp(0.0, 1.0));
+      final speed = 0.12 + (b / 7.0) * 0.28;
+      final force = sqrt((energy * 40 * bassBoost).clamp(0.0, 3.0));
+      final bandHue = (soundHue + b * 30) % 360;
 
-      // Band determines which ring from center lights up
-      final ringDist = (band + 0.5) / 8.0 * maxDist;
+      // Place wave origin: biased toward center, with band-dependent spread
+      final angle = b / 8.0 * 2 * pi - pi / 2;
+      final spread = 0.3; // 0 = always center, 1 = always perimeter
+      final originR = _rows / 2.0 + sin(angle) * _rows / 2.0 * spread;
+      final originC = _cols / 2.0 + cos(angle) * _cols / 2.0 * spread;
 
-      // Fingerprint offsets the angle so similar sounds hit same cells
-      final angleOffset = fp[band] * 2 * pi;
-
-      for (var r = 0; r < _rows; r++) {
-        for (var c = 0; c < _cols; c++) {
-          final dr = r - cr;
-          final dc = c - cc;
-          final dist = sqrt(dr * dr + dc * dc);
-
-          // Wider ring tolerance so more cells get hit
-          final ringDiff = (dist - ringDist).abs();
-          if (ringDiff > 3.0) continue;
-
-          final ringFalloff = 1.0 - ringDiff / 3.0;
-
-          // Dominant band lights the full ring, others favor a direction
-          double angleFactor = 1.0;
-          if (band != dominant) {
-            final cellAngle = atan2(dr, dc);
-            angleFactor = (cos(cellAngle - angleOffset) + 1.0) / 2.0;
-            angleFactor = 0.4 + angleFactor * 0.6;
-          }
-
-          final idx = r * _cols + c;
-          if (idx >= 0 && idx < total) {
-            final v = intensity * ringFalloff * ringFalloff * angleFactor;
-            // Per-band hue offset so different bands get different colors
-            final bandHue = (soundHue + band * 20) % 360;
-            if (v > _glow[idx]) {
-              _audioHue[idx] = bandHue;
-            }
-            _glow[idx] = (_glow[idx] + v).clamp(0.0, 1.0);
-          }
-        }
-      }
+      _audioWaves.add(_AudioWave(
+        intensity: bandLoudness,
+        hue: bandHue,
+        speed: speed,
+        beatForce: force,
+        originR: originR,
+        originC: originC,
+      ));
     }
 
+    // Update per-band previous energy
+    for (var b = 0; b < 8; b++) {
+      _prevBandEnergy[b] = _analyzer.bandEnergy(b);
+    }
+    _prevRms = rms;
+
+    // Novelty detection: compare current fingerprint against recent cache
+    final fp = _analyzer.fingerprint;
+    if (rms > 0.01) {
+      double minDist = double.infinity;
+      int closestIdx = -1;
+      for (var j = 0; j < _recentFingerprints.length; j++) {
+        double dist = 0;
+        for (var i = 0; i < 8; i++) {
+          final d = fp[i] - _recentFingerprints[j][i];
+          dist += d * d;
+        }
+        dist = sqrt(dist);
+        if (dist < minDist) {
+          minDist = dist;
+          closestIdx = j;
+        }
+      }
+
+      if (_recentFingerprints.isEmpty || minDist > _noveltyThreshold) {
+        // New sound detected — trigger a pattern sweep
+        _noveltyPatternActive = true;
+        _noveltyPatternPhase = -4.0;
+        _noveltyPattern = _random.nextInt(_patternCount);
+        // Also start a color sweep if one isn't already running
+        if (!_colorSweepActive) {
+          _startColorSweep();
+        }
+        // Add new fingerprint to cache
+        _recentFingerprints.add(List<double>.from(fp));
+        if (_recentFingerprints.length > _fpCacheSize) {
+          _recentFingerprints.removeAt(0);
+        }
+      } else {
+        // Same sound — refresh the cache entry so it doesn't expire
+        _recentFingerprints[closestIdx] = List<double>.from(fp);
+      }
+    }
   }
 
   void _onAudioError(Object error) {
     debugPrint('Audio error: $error');
+  }
+
+  void _applyNoveltyPattern() {
+    _noveltyPatternPhase += 0.15; // faster than idle
+    final maxDist = (_rows + _cols).toDouble();
+    if (_noveltyPatternPhase > maxDist + 4) {
+      _noveltyPatternActive = false;
+      return;
+    }
+
+    final phase = _noveltyPatternPhase;
+    const intensity = 0.4;
+    const waveWidth = 3.0;
+
+    for (var r = 0; r < _rows; r++) {
+      for (var c = 0; c < _cols; c++) {
+        double dist;
+        switch (_noveltyPattern) {
+          case 0: // center outward
+            final cr = _rows / 2.0;
+            final cc = _cols / 2.0;
+            dist = sqrt((r - cr) * (r - cr) + (c - cc) * (c - cc));
+            break;
+          case 1:
+            dist = c.toDouble();
+            break;
+          case 2:
+            dist = (_cols - 1 - c).toDouble();
+            break;
+          case 3:
+            dist = (r + c) * 0.7;
+            break;
+          case 4:
+          default:
+            dist = (_rows + _cols - 2 - r - c) * 0.7;
+            break;
+        }
+
+        final diff = (phase - dist).abs();
+        if (diff < waveWidth) {
+          final wave = (1.0 - diff / waveWidth);
+          final idx = r * _cols + c;
+          _glowTarget[idx] = max(_glowTarget[idx], wave * wave * intensity);
+        }
+      }
+    }
   }
 
   void _applyIdlePattern() {
@@ -387,7 +689,7 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
           // Smooth falloff with overlap
           final wave = (1.0 - diff / waveWidth);
           final idx = r * _cols + c;
-          _glow[idx] = max(_glow[idx], wave * wave * intensity);
+          _glowTarget[idx] = max(_glowTarget[idx], wave * wave * intensity);
         }
       }
     }
@@ -409,10 +711,26 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
           final nc = c + dc;
           if (nr < _rows && nc < _cols) {
             final idx = nr * _cols + nc;
-            _glow[idx] = max(_glow[idx], 0.12);
+            _glowTarget[idx] = max(_glowTarget[idx], 0.12);
           }
         }
       }
+    }
+
+    // Tap ripples
+    _advanceTapRipples();
+
+    // Audio waves — expanding rings from beats
+    _advanceAudioWaves();
+
+    // Color sweep — triggered by novel sounds
+    if (_colorSweepActive) {
+      _advanceColorSweep();
+    }
+
+    // Novelty pattern: one-shot sweep when a new sound is heard
+    if (_noveltyPatternActive) {
+      _applyNoveltyPattern();
     }
 
     // Idle patterns when no audio for a while
@@ -420,8 +738,17 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
       _applyIdlePattern();
     }
 
-    // Propagate glow
+    // Ease _glow toward _glowTarget (never jump instantly)
     final glowLen = _glow.length;
+    for (var i = 0; i < glowLen; i++) {
+      if (_glowTarget[i] > _glow[i]) {
+        _glow[i] = min(_glow[i] + _glowRiseRate, _glowTarget[i]);
+      }
+      // Decay target so it doesn't stay pegged
+      _glowTarget[i] *= _decayRate;
+    }
+
+    // Propagate glow
     for (var r = 0; r < _rows; r++) {
       for (var c = 0; c < _cols; c++) {
         final idx = r * _cols + c;
@@ -461,28 +788,60 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
     _audioHue = _audioHueNext;
     _audioHueNext = tmpH;
 
-    // Combine accelerometer shake + audio shake
-    final totalShakeX = _shakeVx + _audioShakeX;
-    final totalShakeY = _shakeVy + _audioShakeY;
-    _audioShakeX *= 0.85; // decay audio shake
-    _audioShakeY *= 0.85;
-
-    // Per-cell spring physics: accel pushes, spring pulls back
+    // Per-cell spring physics: accel + beat forces push, spring pulls back
+    final totalShakeX = _shakeVx;
+    final totalShakeY = _shakeVy;
     final glLen = _cellOffsetX.length;
-    for (var i = 0; i < glLen; i++) {
-      final mass = _cellMass[i];
-      _cellVelX[i] += totalShakeX / mass;
-      _cellVelY[i] += totalShakeY / mass;
-      // Spring force toward origin
-      _cellVelX[i] -= _cellOffsetX[i] * _springK;
-      _cellVelY[i] -= _cellOffsetY[i] * _springK;
-      // Damping
-      _cellVelX[i] *= _damping;
-      _cellVelY[i] *= _damping;
-      // Integrate
-      _cellOffsetX[i] += _cellVelX[i];
-      _cellOffsetY[i] += _cellVelY[i];
+    const maxOffset = 80.0; // hard clamp to prevent runaway
+    const maxVel = 20.0;
+
+    void _stepPhysics(
+      List<double> offX, List<double> offY,
+      List<double> velX, List<double> velY,
+      List<double> massArr,
+      List<double> bfX, List<double> bfY,
+      double springPhase,
+    ) {
+      for (var i = 0; i < glLen; i++) {
+        final mass = massArr[i].clamp(0.1, 10.0);
+        velX[i] += totalShakeX / mass;
+        velY[i] += totalShakeY / mass;
+        velX[i] += bfX[i] / mass;
+        velY[i] += bfY[i] / mass;
+        bfX[i] *= 0.85;
+        bfY[i] *= 0.85;
+        final springMod = 0.9 + 0.1 * sin(_tickCount * 0.052 + springPhase);
+        final k = _springK * springMod;
+        final dx = offX[i];
+        final dy = offY[i];
+        final dist2 = dx * dx + dy * dy;
+        final hystK = k + dist2 * 0.0005;
+        velX[i] -= dx * hystK;
+        velY[i] -= dy * hystK;
+        // Friction: base damping + velocity-dependent drag
+        final speed2 = velX[i] * velX[i] + velY[i] * velY[i];
+        final drag = speed2 > 25 ? _damping * 0.85 : _damping;
+        velX[i] *= drag;
+        velY[i] *= drag;
+        // Clamp velocity
+        velX[i] = velX[i].clamp(-maxVel, maxVel);
+        velY[i] = velY[i].clamp(-maxVel, maxVel);
+        // NaN guard
+        if (velX[i].isNaN) velX[i] = 0;
+        if (velY[i].isNaN) velY[i] = 0;
+        offX[i] += velX[i];
+        offY[i] += velY[i];
+        offX[i] = offX[i].clamp(-maxOffset, maxOffset);
+        offY[i] = offY[i].clamp(-maxOffset, maxOffset);
+        if (offX[i].isNaN) offX[i] = 0;
+        if (offY[i].isNaN) offY[i] = 0;
+      }
     }
+
+    _stepPhysics(_cellOffsetX, _cellOffsetY, _cellVelX, _cellVelY,
+        _cellMass, _beatForceX, _beatForceY, 0);
+    _stepPhysics(_backCellOffsetX, _backCellOffsetY, _backCellVelX, _backCellVelY,
+        _backCellMass, _backBeatForceX, _backBeatForceY, pi);
 
     setState(() {});
   }
@@ -492,6 +851,7 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
     _accelSub?.cancel();
     if (_micStarted) _audioCapture.stop();
     _ticker.dispose();
+    WakelockPlus.disable();
     super.dispose();
   }
 
@@ -505,10 +865,106 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
     return total > 0 ? c / total : 0;
   }
 
+  void _onTap(Offset position) {
+    if (!_gridInitialized) return;
+    final cellSize = MediaQuery.of(context).size.width / _visibleCols;
+    // Convert screen position to grid coordinates (accounting for extra margin)
+    final tapCol = (position.dx / cellSize).floor() + _extraCols;
+    final tapRow = (position.dy / cellSize).floor() + _extraRows;
+    if (tapCol < 0 || tapCol >= _cols || tapRow < 0 || tapRow >= _rows) return;
+
+    // Trigger expanding ripple from tap point
+    _tapRipples.add(_TapRipple(col: tapCol, row: tapRow));
+  }
+
+  final List<_TapRipple> _tapRipples = [];
+
+  void _advanceTapRipples() {
+    final total = _glow.length;
+    for (final ripple in _tapRipples) {
+      ripple.phase += 0.18;
+      const intensity = 1.0;
+      const waveWidth = 3.5;
+
+      for (var r = 0; r < _rows; r++) {
+        for (var c = 0; c < _cols; c++) {
+          final dr = r - ripple.row;
+          final dc = c - ripple.col;
+          final dist = sqrt((dr * dr + dc * dc).toDouble());
+          final diff = (ripple.phase - dist).abs();
+          if (diff > waveWidth) continue;
+
+          final wave = (1.0 - diff / waveWidth);
+          final idx = r * _cols + c;
+          if (idx >= 0 && idx < total) {
+            _glowTarget[idx] = max(_glowTarget[idx], wave * wave * intensity);
+
+            // Radial force outward from tap point
+            if (dist > 0.5) {
+              final force = wave * wave * 5.0;
+              final nx = dc / dist;
+              final ny = dr / dist;
+              _beatForceX[idx] += nx * force;
+              _beatForceY[idx] += ny * force;
+              _backBeatForceX[idx] += nx * force;
+              _backBeatForceY[idx] += ny * force;
+            }
+          }
+        }
+      }
+    }
+    // Remove finished ripples
+    _tapRipples.removeWhere((r) => r.phase > _rows + _cols);
+  }
+
+  void _advanceAudioWaves() {
+    final total = _glow.length;
+    final maxDist = sqrt((_rows * _rows + _cols * _cols).toDouble());
+
+    for (final wave in _audioWaves) {
+      wave.phase += wave.speed;
+      const waveWidth = 2.5;
+      final or = wave.originR;
+      final oc = wave.originC;
+
+      for (var r = 0; r < _rows; r++) {
+        for (var c = 0; c < _cols; c++) {
+          final dr = r - or;
+          final dc = c - oc;
+          final dist = sqrt(dr * dr + dc * dc);
+          final diff = (wave.phase - dist).abs();
+          if (diff > waveWidth) continue;
+
+          final falloff = 1.0 - diff / waveWidth;
+          final v = falloff * falloff * wave.intensity;
+          final idx = r * _cols + c;
+          if (idx < 0 || idx >= total) continue;
+
+          if (v > _glowTarget[idx]) {
+            _audioHue[idx] = wave.hue;
+          }
+          _glowTarget[idx] = max(_glowTarget[idx], v);
+
+          // Push cells away from wave origin
+          if (dist > 0.5 && wave.beatForce > 0) {
+            final force = wave.beatForce * falloff * falloff;
+            final nx = dc / dist;
+            final ny = dr / dist;
+            _beatForceX[idx] += nx * force;
+            _beatForceY[idx] += ny * force;
+            _backBeatForceX[idx] += nx * force;
+            _backBeatForceY[idx] += ny * force;
+          }
+        }
+      }
+    }
+    _audioWaves.removeWhere((w) => w.phase > maxDist + 4);
+  }
+
   double _tiltHue() {
     final nx = (_x / 10.0).clamp(-1.0, 1.0);
     final ny = (_y / 10.0).clamp(-1.0, 1.0);
-    return (atan2(ny, nx) * 180 / pi + 300) % 360; // flat = green
+    return (atan2(ny, nx) * 180 / pi + _hueAnchor) % 360;
   }
 
   double _tiltSaturation() {
@@ -528,9 +984,11 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
       backgroundColor: HSVColor.fromAHSV(1, hue, sat * 0.3, 0.15).toColor(),
       body: Stack(
         children: [
-          LayoutBuilder(
-            builder: (context, constraints) {
-              final cellSize = constraints.maxWidth / _visibleCols;
+          GestureDetector(
+            onTapDown: (details) => _onTap(details.localPosition),
+            child: LayoutBuilder(
+              builder: (context, constraints) {
+                final cellSize = constraints.maxWidth / _visibleCols;
               final neededRows = (constraints.maxHeight / cellSize).ceil();
               if (neededRows != _visibleRows) {
                 WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -559,10 +1017,20 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
                   wobbleSpeed: _wobbleSpeed,
                   cellOffsetX: _cellOffsetX,
                   cellOffsetY: _cellOffsetY,
+                  sizeJitter: _sizeJitter,
+                  backHueOffsets: _backHueOffsets,
+                  backBrightOffsets: _backBrightOffsets,
+                  backWobblePhaseX: _backWobblePhaseX,
+                  backWobblePhaseY: _backWobblePhaseY,
+                  backWobbleSpeed: _backWobbleSpeed,
+                  backSizeJitter: _backSizeJitter,
+                  backCellOffsetX: _backCellOffsetX,
+                  backCellOffsetY: _backCellOffsetY,
                   tick: _tickCount,
                 ),
               );
-            },
+              },
+            ),
           ),
           if (_showDebug)
             Positioned(
@@ -660,8 +1128,13 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
                     ),
                     const SizedBox(height: 6),
                     Text(
-                      'Tilt: X${_x.toStringAsFixed(1)} Y${_y.toStringAsFixed(1)} Z${_z.toStringAsFixed(1)}  Idle: $_idleTicks',
+                      'Tilt: X${_x.toStringAsFixed(1)} Y${_y.toStringAsFixed(1)} Z${_z.toStringAsFixed(1)}',
                       style: const TextStyle(color: Colors.white38, fontSize: 11, fontFamily: 'monospace'),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      'Mic: $_micStatus  Callbacks: $_audioCallbackCount  RMS: ${_analyzer.rms.toStringAsFixed(4)}',
+                      style: const TextStyle(color: Colors.orangeAccent, fontSize: 11, fontFamily: 'monospace'),
                     ),
                   ],
                 ),
@@ -703,6 +1176,15 @@ class _GridPainter extends CustomPainter {
   final List<double> wobbleSpeed;
   final List<double> cellOffsetX;
   final List<double> cellOffsetY;
+  final List<double> sizeJitter;
+  final List<double> backHueOffsets;
+  final List<double> backBrightOffsets;
+  final List<double> backWobblePhaseX;
+  final List<double> backWobblePhaseY;
+  final List<double> backWobbleSpeed;
+  final List<double> backSizeJitter;
+  final List<double> backCellOffsetX;
+  final List<double> backCellOffsetY;
   final int tick;
 
   _GridPainter({
@@ -723,6 +1205,15 @@ class _GridPainter extends CustomPainter {
     required this.wobbleSpeed,
     required this.cellOffsetX,
     required this.cellOffsetY,
+    required this.sizeJitter,
+    required this.backHueOffsets,
+    required this.backBrightOffsets,
+    required this.backWobblePhaseX,
+    required this.backWobblePhaseY,
+    required this.backWobbleSpeed,
+    required this.backSizeJitter,
+    required this.backCellOffsetX,
+    required this.backCellOffsetY,
     required this.tick,
   });
 
@@ -731,13 +1222,87 @@ class _GridPainter extends CustomPainter {
     final fillPaint = Paint()..style = PaintingStyle.fill;
     final borderPaint = Paint()
       ..style = PaintingStyle.stroke
-      ..strokeWidth = 2.0;
+      ..strokeWidth = 10.0;
 
     final t = tick * 0.015; // slower base time for supple motion
-    const maxWobble = 2.0; // gentle idle sway
-    const glowWobbleBoost = 5.0; // extra when glowing
+    const maxWobble = 0.8; // gentle idle sway
+    const glowWobbleBoost = 2.0; // extra when glowing
+    final radius = Radius.circular(cellSize * 0.08);
 
     final total = glow.length;
+
+    // Pass 1: draw dark base tiles at home positions to fill gaps
+    for (var r = 0; r < rows; r++) {
+      for (var c = 0; c < cols; c++) {
+        final idx = r * cols + c;
+        if (idx >= total) continue;
+        final cellHue = (hue + hueOffsets[idx]) % 360;
+        final isLight = (r + c) % 2 == 0;
+        final baseBright = ((isLight ? brightness : brightness * 0.7) + brightOffsets[idx])
+            .clamp(0.2, 1.0) * 0.4;
+        final baseSat = (isLight ? saturation : saturation * 0.8) * 0.5;
+
+        fillPaint.color = HSVColor.fromAHSV(1, cellHue, baseSat, baseBright).toColor();
+        final originX = (c - extraCols) * cellSize;
+        final originY = (r - extraRows) * cellSize;
+        canvas.drawRRect(
+          RRect.fromRectAndRadius(Rect.fromLTWH(originX, originY, cellSize, cellSize), radius),
+          fillPaint,
+        );
+      }
+    }
+
+    // Pass 2: back layer — offset by half a cell, darker
+    final halfCell = cellSize * 0.5;
+    for (var r = 0; r < rows; r++) {
+      for (var c = 0; c < cols; c++) {
+        final idx = r * cols + c;
+        if (idx >= total) continue;
+        final g = glow[idx].clamp(0.0, 1.0);
+
+        final speed = backWobbleSpeed[idx];
+        final phX = backWobblePhaseX[idx];
+        final phY = backWobblePhaseY[idx];
+        final amp = maxWobble + g * glowWobbleBoost;
+        final wobbleX = (sin(t * speed * 0.8 + phX) * 0.6 +
+                sin(t * speed * 1.5 + phX * 2.1) * 0.3) * amp;
+        final wobbleY = (cos(t * speed * 0.7 + phY) * 0.6 +
+                cos(t * speed * 1.3 + phY * 1.7) * 0.3) * amp;
+
+        final cellHue = (hue + backHueOffsets[idx]) % 360;
+        final blendedHue = g > 0.01
+            ? _lerpAngle(cellHue, audioHue[idx], g.clamp(0.0, 0.8))
+            : cellHue;
+
+        final isLight = (r + c) % 2 == 0;
+        final baseBright = ((isLight ? brightness : brightness * 0.7) + backBrightOffsets[idx])
+            .clamp(0.2, 1.0) * 0.7; // darker than front
+        final baseSat = (isLight ? saturation : saturation * 0.8) * 0.9;
+        final fillBright = (baseBright + g * (1.0 - baseBright) * 0.5).clamp(0.0, 1.0);
+        final fillSat = (baseSat + g * (1.0 - baseSat) * 0.4).clamp(0.0, 1.0);
+
+        final physX = backCellOffsetX[idx];
+        final physY = backCellOffsetY[idx];
+        final originX = (c - extraCols) * cellSize + halfCell;
+        final originY = (r - extraRows) * cellSize + halfCell;
+        final sz = (cellSize - 1.0) * backSizeJitter[idx];
+        final pad = (cellSize - 1.0 - sz) / 2;
+        final x = originX + pad + wobbleX + physX;
+        final y = originY + pad + wobbleY + physY;
+
+        final rrect = RRect.fromRectAndRadius(Rect.fromLTWH(x, y, sz, sz), radius);
+
+        fillPaint.color = HSVColor.fromAHSV(1, blendedHue, fillSat, fillBright).toColor();
+        canvas.drawRRect(rrect, fillPaint);
+
+        final borderHue = (hue + 180) % 360;
+        final borderBright = (fillBright * 0.5).clamp(0.0, 1.0);
+        borderPaint.color = HSVColor.fromAHSV(0.85, borderHue, fillSat, borderBright).toColor();
+        canvas.drawRRect(rrect, borderPaint);
+      }
+    }
+
+    // Pass 3: front layer — displaced cells on top
     for (var r = 0; r < rows; r++) {
       for (var c = 0; c < cols; c++) {
         final idx = r * cols + c;
@@ -767,8 +1332,6 @@ class _GridPainter extends CustomPainter {
             ? _lerpAngle(cellHue, aHue, g.clamp(0.0, 0.8))
             : cellHue;
 
-        final borderHue = (blendedHue + 30 + g * 40) % 360;
-
         final isLight = (r + c) % 2 == 0;
         final baseBright =
             ((isLight ? brightness : brightness * 0.7) + brightOffsets[idx])
@@ -780,30 +1343,30 @@ class _GridPainter extends CustomPainter {
             (baseBright + g * (1.0 - baseBright) * 0.7).clamp(0.0, 1.0);
         final fillSat = (baseSat + g * (1.0 - baseSat) * 0.5).clamp(0.0, 1.0);
 
-        fillPaint.color =
-            HSVColor.fromAHSV(1, blendedHue, fillSat, fillBright).toColor();
-
-        final borderBright = (0.4 + g * 0.6).clamp(0.0, 1.0);
-        final borderSat = (saturation * 0.6 + g * 0.4).clamp(0.0, 1.0);
-        borderPaint.color =
-            HSVColor.fromAHSV(1, borderHue, borderSat, borderBright)
-                .toColor();
-
         // Combine wobble + shake physics offset, shifted for off-screen margin
-        const inset = 2.0;
+        const inset = 0.5;
         final physX = cellOffsetX[idx];
         final physY = cellOffsetY[idx];
         final originX = (c - extraCols) * cellSize;
         final originY = (r - extraRows) * cellSize;
-        final rect = Rect.fromLTWH(
-          originX + inset + wobbleX + physX,
-          originY + inset + wobbleY + physY,
-          cellSize - inset * 2,
-          cellSize - inset * 2,
+        final sz = (cellSize - inset * 2) * sizeJitter[idx];
+        final pad = (cellSize - inset * 2 - sz) / 2;
+        final x = originX + inset + pad + wobbleX + physX;
+        final y = originY + inset + pad + wobbleY + physY;
+
+        final rrect = RRect.fromRectAndRadius(
+          Rect.fromLTWH(x, y, sz, sz), radius,
         );
 
-        canvas.drawRect(rect, fillPaint);
-        canvas.drawRect(rect, borderPaint);
+        // Main fill
+        fillPaint.color = HSVColor.fromAHSV(1, blendedHue, fillSat, fillBright).toColor();
+        canvas.drawRRect(rrect, fillPaint);
+
+        // Border — complementary to main tilt hue
+        final borderHue = (hue + 180) % 360;
+        final borderBright = (fillBright * 0.6).clamp(0.0, 1.0);
+        borderPaint.color = HSVColor.fromAHSV(0.9, borderHue, fillSat, borderBright).toColor();
+        canvas.drawRRect(rrect, borderPaint);
       }
     }
   }
