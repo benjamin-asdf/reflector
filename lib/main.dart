@@ -171,6 +171,7 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
   double _prevRms = 0; // for beat detection (rising edge)
   int _lastRippleMs = 0; // cooldown for audio ripple spawning
   final List<double> _prevBandEnergy = List.filled(8, 0.0);
+  final List<int> _bandCache = List.filled(8, 0);
 
   // Extra off-screen margin so cells can flow in from edges
   static const int _extraCols = 2;
@@ -201,7 +202,7 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
   int get _total => _cols * _rows;
   int _colorSeed = 0;
   double _hueAnchor = 300; // +300 = green at flat; changes on shuffle
-  Random _random = Random();
+
   List<double> _glow = [];
   List<double> _glowTarget = []; // desired glow — _glow eases toward this
   List<double> _glowNext = [];
@@ -351,7 +352,7 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
     final total = _total;
     // Seeded random for reproducible color palette
     final colorRng = Random(_colorSeed);
-    _random = Random();
+
     _glow = List.filled(total, 0.0);
     _glowTarget = List.filled(total, 0.0);
     _glowNext = List.filled(total, 0.0);
@@ -361,9 +362,9 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
     _hueOffsets = List.generate(total, (_) => colorRng.nextDouble() * 60 - 30);
     _brightOffsets =
         List.generate(total, (_) => colorRng.nextDouble() * 0.3 - 0.15);
-    _wobblePhaseX = List.generate(total, (_) => _random.nextDouble() * 2 * pi);
-    _wobblePhaseY = List.generate(total, (_) => _random.nextDouble() * 2 * pi);
-    _wobbleSpeed = List.generate(total, (_) => 0.3 + _random.nextDouble() * 0.7);
+    _wobblePhaseX = List.generate(total, (i) => (i * 2.3987) % (2 * pi));
+    _wobblePhaseY = List.generate(total, (i) => (i * 3.7141) % (2 * pi));
+    _wobbleSpeed = List.generate(total, (i) => 0.3 + ((i * 1.6183) % 1.0) * 0.7);
     _sizeJitter = List.generate(total, (_) => 0.85 + colorRng.nextDouble() * 0.15);
     _cellOffsetX = List.filled(total, 0.0);
     _cellOffsetY = List.filled(total, 0.0);
@@ -377,9 +378,9 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
     final backRng = Random(_colorSeed + 1);
     _backHueOffsets = List.generate(total, (_) => backRng.nextDouble() * 60 - 30);
     _backBrightOffsets = List.generate(total, (_) => backRng.nextDouble() * 0.3 - 0.15);
-    _backWobblePhaseX = List.generate(total, (_) => _random.nextDouble() * 2 * pi);
-    _backWobblePhaseY = List.generate(total, (_) => _random.nextDouble() * 2 * pi);
-    _backWobbleSpeed = List.generate(total, (_) => 0.3 + _random.nextDouble() * 0.7);
+    _backWobblePhaseX = List.generate(total, (i) => ((i + total) * 2.3987) % (2 * pi));
+    _backWobblePhaseY = List.generate(total, (i) => ((i + total) * 3.7141) % (2 * pi));
+    _backWobbleSpeed = List.generate(total, (i) => 0.3 + (((i + total) * 1.6183) % 1.0) * 0.7);
     _backSizeJitter = List.generate(total, (_) => 0.85 + backRng.nextDouble() * 0.15);
     _backCellOffsetX = List.filled(total, 0.0);
     _backCellOffsetY = List.filled(total, 0.0);
@@ -408,7 +409,7 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
     _nextBrightOffsets = List.generate(total, (_) => colorRng.nextDouble() * 0.3 - 0.15);
     _colorSweepActive = true;
     _colorSweepPhase = -4.0;
-    _colorSweepPattern = _random.nextInt(_patternCount);
+    _colorSweepPattern = (_nextColorSeed ~/ 7) % _patternCount;
   }
 
   void _advanceColorSweep() {
@@ -529,6 +530,12 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
 
     _idleTicks = 0; // any sound above silence threshold resets idle
 
+    // Loud audio shifts the base hue (like tilting the phone)
+    final loudnessForHue = (rms * 20).clamp(0.0, 1.0);
+    if (loudnessForHue > 0.3) {
+      _hueAnchor = (_hueAnchor + (loudnessForHue - 0.3) * 4.0) % 360;
+    }
+
     // Spectral centroid for hue derivation (overall tonal color)
     double centroid = 0;
     double totalEnergy = 0;
@@ -540,104 +547,66 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
     if (totalEnergy > 0) centroid /= totalEnergy;
     // Hue from spectral centroid — overall sound color
     final soundHue = (centroid / 7.0 * 360) % 360;
-
     final loudness = (rms * 50).clamp(0.0, 1.0);
 
     // Per-band: pick a rect deterministically from frequency, spawn a pattern from it
     final nowMs = DateTime.now().millisecondsSinceEpoch;
-    final canSpawnRipple = nowMs - _lastRippleMs >= 120;
-    final quietBoost = rms < 0.015 ? 6.0 : (rms < 0.03 ? 4.0 : (rms < 0.06 ? 2.0 : 1.0));
+    final canSpawnRipple = nowMs - _lastRippleMs >= 300;
+   //    final quietBoost = rms < 0.015 ? 6.0 : (rms < 0.03 ? 4.0 : (rms < 0.06 ? 2.0 : 1.0));
+    final quietBoost = 1.0;
 
+    // Build familiarity: bands with energy get cache++, all decay each beat
+    final bandRises = <MapEntry<int, double>>[];
     for (var b = 0; b < 8; b++) {
       final energy = _analyzer.bandEnergy(b);
       if (energy < 0.000005) continue;
       if (energy <= _prevBandEnergy[b] * 0.90) continue;
+      _bandCache[b]++;
+      bandRises.add(MapEntry(b, energy - _prevBandEnergy[b]));
+    }
+    bandRises.sort((a, b) => b.value.compareTo(a.value));
 
-      final bandLoudness = sqrt((energy * 80 * quietBoost).clamp(0.0, 1.0));
-      final speed = 0.15 + (b / 7.0) * 0.2;
-      final force = sqrt((energy * 100 * quietBoost).clamp(0.0, 4.0));
-      final bandHue = (soundHue + b * 30) % 360;
-
-      // --- Origin selection: varies by band character ---
-      int originC, originR;
-      final waveSeed = nowMs + b;
-      final patRng = Random(waveSeed);
-      final transientRatio = _prevBandEnergy[b] > 0.00001
-          ? energy / _prevBandEnergy[b]
-          : 10.0;
-
-      if (transientRatio > 5.0) {
-        // Sharp transient: random position for surprise
-        originC = patRng.nextInt(_cols);
-        originR = patRng.nextInt(_rows);
-      } else if (b >= 6) {
-        // High freq: edges and corners — shimmer from the periphery
-        final edge = patRng.nextInt(4);
-        originC = edge < 2 ? (edge == 0 ? 0 : _cols - 1) : patRng.nextInt(_cols);
-        originR = edge >= 2 ? (edge == 2 ? 0 : _rows - 1) : patRng.nextInt(_rows);
-      } else {
-        // Mid bands: original mapping — band selects column, energy selects row
-        originC = ((b / 7.0) * (_cols - 1)).round().clamp(0, _cols - 1);
-        originR = ((energy * 5000).clamp(0.0, 1.0) * (_rows - 1)).round().clamp(0, _rows - 1);
+    if (canSpawnRipple) {
+      // Decay all band caches by 1 each beat
+      for (var b = 0; b < 8; b++) {
+        if (_bandCache[b] > 0) _bandCache[b]--;
       }
-      originC = originC.clamp(0, _cols - 1);
-      originR = originR.clamp(0, _rows - 1);
+    }
 
+    // Spawn ripples for top 2 bands
+    final topBands = bandRises.take(2);
+    if (canSpawnRipple) {
+      for (final entry in topBands) {
+        final b = entry.key;
+        final energy = _analyzer.bandEnergy(b);
+        final bandLoudness = sqrt((energy * 80 * quietBoost).clamp(0.0, 1.0));
+        final speed = 0.15 + (b / 7.0) * 0.2;
+        final force = sqrt((energy * 100 * quietBoost).clamp(0.0, 4.0));
+        final bandHue = (soundHue + b * 30) % 360;
 
-      // Cooldown: only spawn ripples/patterns every 120ms
-      if (!canSpawnRipple) continue;
+        final waveSeed = nowMs + b;
+        final patRng = Random(waveSeed);
 
-      // Light up the origin square and ripple outward from it
-      final originIdx = originR * _cols + originC;
-      if (originIdx >= 0 && originIdx < _glowTarget.length) {
-        _glowTarget[originIdx] = max(_glowTarget[originIdx], bandLoudness);
-        _audioHueTarget[originIdx] = bandHue;
+        int originC = ((b / 7.0) * (_cols - 1)).round().clamp(0, _cols - 1);
+        int originR = ((energy * 5000).clamp(0.0, 1.0) * (_rows - 1)).round().clamp(0, _rows - 1);
+
+        // Light up the origin square and ripple outward from it
+        final originIdx = originR * _cols + originC;
+        if (originIdx >= 0 && originIdx < _glowTarget.length) {
+          _glowTarget[originIdx] = max(_glowTarget[originIdx], bandLoudness);
+          _audioHueTarget[originIdx] = bandHue;
+        }
+        // Softer sounds ripple fewer cells
+        final maxRad = 3.0 + bandLoudness * (_rows + _cols) * 0.5;
+        _tapRipples.add(_TapRipple(col: originC, row: originR, hue: bandHue, force: 3.0, maxRadius: maxRad));
+        _lastRippleMs = nowMs;
+
+        final choices = [_WavePattern.grow];
+        _WavePattern pattern = choices[patRng.nextInt(choices.length)];
+        double patternForce = force;
+
+        final path = _generatePath(pattern, originR, originC, patRng);
       }
-      // Softer sounds ripple fewer cells
-      final maxRad = 3.0 + bandLoudness * (_rows + _cols) * 0.5;
-      _tapRipples.add(_TapRipple(col: originC, row: originR, hue: bandHue, force: 3.0, maxRadius: maxRad));
-      _lastRippleMs = nowMs;
-
-      // --- Pattern selection: audio-reactive, not just random ---
-      _WavePattern pattern;
-      double patternForce = force;
-      double patternSpeed = speed;
-
-      if (transientRatio > 5.0) {
-        // Sharp transient (any band): explosive grow or shockwave
-        pattern = patRng.nextBool() ? _WavePattern.grow : _WavePattern.shockwave;
-        patternForce = force * 1.0;
-        patternSpeed = speed * 1.4;
-      } else if (b >= 6) {
-        // High freq: rain or spiral — delicate, fast
-        pattern = patRng.nextBool() ? _WavePattern.rain : _WavePattern.spiral;
-        patternForce = force * 0.4;
-        patternSpeed = speed * 1.6;
-      } else if (b >= 4) {
-        // Upper mids: spiral or snake — flowing motion
-        pattern = patRng.nextBool() ? _WavePattern.spiral : _WavePattern.snake;
-        patternForce = force * 0.7;
-        patternSpeed = speed * 1.2;
-      } else {
-        // Lower mids: tetris or grow — chunky, moderate push
-        final choices = [_WavePattern.tetris, _WavePattern.grow, _WavePattern.cross];
-        pattern = choices[patRng.nextInt(choices.length)];
-        patternForce = force * 0.8;
-      }
-
-      final path = _generatePath(pattern, originR, originC, patRng);
-
-      _audioWaves.add(_AudioWave(
-        intensity: bandLoudness,
-        hue: bandHue,
-        speed: patternSpeed,
-        beatForce: patternForce,
-        originR: originR.toDouble(),
-        originC: originC.toDouble(),
-        pattern: pattern,
-        seed: waveSeed,
-        path: path,
-      ));
     }
 
     // Update per-band previous energy
@@ -668,7 +637,7 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
         // New sound detected — trigger a pattern sweep
         _noveltyPatternActive = true;
         _noveltyPatternPhase = -4.0;
-        _noveltyPattern = _random.nextInt(_patternCount);
+        _noveltyPattern = ((fp[0] * 1000 + fp[3] * 500).toInt().abs()) % _patternCount;
         // Also start a color sweep if one isn't already running
         if (!_colorSweepActive) {
           _startColorSweep();
@@ -740,8 +709,8 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
   int _lastIdleRippleMs = 0;
 
   void _applyIdlePattern() {
-    _patternPhase += 0.03;
-    _idleHue = (_idleHue + 0.5) % 360;
+    _patternPhase += 0.012;
+    _idleHue = (_idleHue + 0.2) % 360;
     final maxDist = (_rows + _cols).toDouble();
     if (_patternPhase > maxDist + 1) {
       _patternPhase = -2.0;
@@ -787,18 +756,17 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
 
     // Spawn actual ripples frequently — same as audio/tap ripples
     final nowMs = DateTime.now().millisecondsSinceEpoch;
-    if (nowMs - _lastIdleRippleMs > 800) {
+    if (nowMs - _lastIdleRippleMs > 2000) {
       _lastIdleRippleMs = nowMs;
-      final rng = Random(nowMs);
-      final rc = rng.nextInt(_rows);
-      final cc = rng.nextInt(_cols);
+      final rc = (nowMs ~/ 2000) % _rows;
+      final cc = ((nowMs ~/ 2000) * 7) % _cols;
       _tapRipples.add(_TapRipple(
         col: cc, row: rc, force: 0.3,
-        maxRadius: 4.0 + rng.nextDouble() * 6.0,
+        maxRadius: 4.0 + ((nowMs % 6000) / 1000.0),
       ));
 
       // Occasionally trigger a full color sweep — new hue palette
-      if (!_colorSweepActive && rng.nextInt(8) == 0) {
+      if (!_colorSweepActive && (nowMs ~/ 2000) % 8 == 0) {
         _startColorSweep();
       }
     }
@@ -815,18 +783,19 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
     _advanceTapRipples();
 
     // Audio waves — expanding rings from beats
-    _advanceAudioWaves();
+    //    _advanceAudioWaves();
 
     // Color sweep — triggered by novel sounds
     if (_colorSweepActive) {
-      _advanceColorSweep();
+//      _advanceColorSweep();
     }
 
     // Novelty pattern: one-shot sweep when a new sound is heard
-    if (_noveltyPatternActive) {
-      _applyNoveltyPattern();
-    }
+    // if (_noveltyPatternActive) {
+    //   _applyNoveltyPattern();
+    // }
 
+    
     // Idle patterns when no audio for a while
     if (_idleTicks > _idleThreshold) {
       _applyIdlePattern();
@@ -991,17 +960,18 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
     final tapRow = (position.dy / cellSize).floor() + _extraRows;
     if (tapCol < 0 || tapCol >= _cols || tapRow < 0 || tapRow >= _rows) return;
 
-    // Big color ripple from tap
-    final tapHue = (_random.nextDouble() * 360);
+    // Big color ripple from tap — hue derived from tap position + current anchor
+    final tapHue = (_hueAnchor + tapCol * 37.0 + tapRow * 53.0) % 360;
     _tapRipples.add(_TapRipple(
       col: tapCol, row: tapRow, hue: tapHue, force: 3.0,
       maxRadius: (_rows + _cols).toDouble(),
     ));
 
     // Also spawn an audio wave pattern for extra visual punch
-    final rng = Random(DateTime.now().millisecondsSinceEpoch);
-    final patterns = [_WavePattern.shockwave, _WavePattern.spiral, _WavePattern.cross];
-    final pattern = patterns[rng.nextInt(patterns.length)];
+    final tapSeed = tapCol * _rows + tapRow + DateTime.now().millisecondsSinceEpoch;
+    final rng = Random(tapSeed);
+    final patterns = [_WavePattern.shockwave];
+    final pattern = patterns[tapSeed % patterns.length];
     final path = _generatePath(pattern, tapRow, tapCol, rng);
     _audioWaves.add(_AudioWave(
       intensity: 0.8,
@@ -1011,12 +981,12 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
       originR: tapRow.toDouble(),
       originC: tapCol.toDouble(),
       pattern: pattern,
-      seed: rng.nextInt(99999),
+      seed: tapSeed % 99999,
       path: path,
     ));
 
     // Trigger a color sweep on every other tap
-    if (!_colorSweepActive && rng.nextBool()) {
+    if (!_colorSweepActive && (tapCol + tapRow) % 2 == 0) {
       _startColorSweep();
     }
   }
@@ -1034,7 +1004,7 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
 
     for (final ripple in _tapRipples) {
       ripple.phase += 0.18;
-      if (ripple.phase > ripple.maxRadius) continue; // stop expanding
+      // if (ripple.phase > ripple.maxRadius) continue; // stop expanding
       const intensity = 1.0;
       const waveWidth = 3.5;
 
@@ -1094,7 +1064,7 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
     }
 
     // Remove finished ripples
-    _tapRipples.removeWhere((r) => r.phase > min(r.maxRadius + 4, (_rows + _cols).toDouble()));
+    _tapRipples.removeWhere((r) => r.phase > min(r.maxRadius + 20, (_rows + _cols).toDouble()));
   }
 
   // Generate a path of [row, col] cells for pattern-based waves
