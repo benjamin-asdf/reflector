@@ -601,9 +601,27 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
         _tapRipples.add(_TapRipple(col: originC, row: originR, hue: bandHue, force: 3.0, maxRadius: maxRad));
         _lastRippleMs = nowMs;
 
-        final choices = [_WavePattern.grow];
-        _WavePattern pattern = choices[patRng.nextInt(choices.length)];
+        // Pattern based on audio character: transient ratio + band frequency
+        final transientRatio = _prevBandEnergy[b] > 0.00001
+            ? energy / _prevBandEnergy[b]
+            : 10.0;
+        _WavePattern pattern;
         double patternForce = force;
+        if (transientRatio > 5.0) {
+          // Sharp transient: explosive
+          pattern = _WavePattern.shockwave;
+          patternForce = force * 1.3;
+        } else if (b <= 1) {
+          // Low freq: heavy, expanding
+          pattern = transientRatio > 2.0 ? _WavePattern.grow : _WavePattern.cross;
+        } else if (b <= 4) {
+          // Mid freq: flowing
+          pattern = transientRatio > 2.0 ? _WavePattern.spiral : _WavePattern.snake;
+        } else {
+          // High freq: fine detail
+          pattern = transientRatio > 2.0 ? _WavePattern.rain : _WavePattern.tetris;
+          patternForce = force * 0.6;
+        }
 
         final path = _generatePath(pattern, originR, originC, patRng);
       }
