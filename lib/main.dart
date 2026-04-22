@@ -7,6 +7,7 @@ import 'package:flutter/scheduler.dart';
 import 'package:flutter_audio_capture/flutter_audio_capture.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:sensors_plus/sensors_plus.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 
 void main() {
@@ -267,6 +268,9 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
   double _noveltyPatternPhase = 0;
   int _noveltyPattern = 0;
 
+  // Intro modal
+  bool _showIntroModal = false;
+
   // Debug
   bool _showDebug = false;
 
@@ -349,7 +353,7 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
       _z += (event.z - _z) * _smoothing;
     });
 
-    _startMic();
+    _checkIntroAndStartMic();
 
     // Tick loop for wave propagation
     _ticker = createTicker(_onTick)..start();
@@ -493,6 +497,23 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
         }
       }
     }
+  }
+
+  Future<void> _checkIntroAndStartMic() async {
+    final prefs = await SharedPreferences.getInstance();
+    final hasSeenIntro = prefs.getBool('hasSeenIntro') ?? false;
+    if (!hasSeenIntro) {
+      setState(() => _showIntroModal = true);
+    } else {
+      _startMic();
+    }
+  }
+
+  Future<void> _dismissIntro() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('hasSeenIntro', true);
+    setState(() => _showIntroModal = false);
+    _startMic();
   }
 
   String _micStatus = 'init';
@@ -1456,6 +1477,55 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
               },
             ),
           ),
+          if (_showIntroModal)
+            GestureDetector(
+              onTap: _dismissIntro,
+              child: Container(
+                color: Colors.black54,
+                child: Center(
+                  child: Container(
+                    margin: const EdgeInsets.symmetric(horizontal: 40),
+                    padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 40),
+                    decoration: BoxDecoration(
+                      color: Colors.black87,
+                      borderRadius: BorderRadius.circular(20),
+                      border: Border.all(color: Colors.white24),
+                    ),
+                    child: const Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(
+                          'I react to sound',
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 24,
+                            fontWeight: FontWeight.w300,
+                          ),
+                        ),
+                        SizedBox(height: 16),
+                        Text(
+                          'Play some music or make noise\nand watch the colors dance.',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                            color: Colors.white54,
+                            fontSize: 15,
+                            height: 1.5,
+                          ),
+                        ),
+                        SizedBox(height: 24),
+                        Text(
+                          'Tap anywhere to continue',
+                          style: TextStyle(
+                            color: Colors.white38,
+                            fontSize: 13,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
           if (_showDebug)
             Positioned(
               left: 12,

@@ -39,6 +39,7 @@ dependencies:
   flutter_audio_capture:
     path: flutter_audio_capture_local
   wakelock_plus: ^1.4.0
+  shared_preferences: ^2.5.0
 
 dev_dependencies:
   flutter_test:
