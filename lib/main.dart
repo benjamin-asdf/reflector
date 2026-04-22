@@ -195,7 +195,8 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
   List<double> _cellMass = [];             
 
   // Grid — includes extra off-screen margin
-  static const int _visibleCols = 8;
+  static const int _portraitCols = 8;
+  int _visibleCols = 8;
   int _visibleRows = 14;
   int get _cols => _visibleCols + _extraCols * 2;
   int get _rows => _visibleRows + _extraRows * 2;
@@ -306,7 +307,14 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
               now - _lastShakeShuffle > _shakeCooldownMs) {
             _lastShakeShuffle = now;
             _colorSeed = now;
-            _hueAnchor = Random(_colorSeed).nextDouble() * 360;
+            // Derive hue from current spectral centroid — what you hear sets the color
+            double cent = 0, totE = 0;
+            for (var b = 0; b < 8; b++) {
+              final e = _analyzer.bandEnergy(b);
+              cent += b * e;
+              totE += e;
+            }
+            _hueAnchor = totE > 0 ? (cent / totE / 7.0 * 360) % 360 : _hueAnchor;
             _shuffleColors();
             _hasFirstStroke = false;
           } else {
@@ -347,11 +355,14 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
     _ticker = createTicker(_onTick)..start();
   }
 
+  // Deterministic per-cell offset using golden-ratio hashing (no RNG)
+  static double _cellHash(int i, double seed) =>
+      ((i * 2.3987 + seed * 1.6183) % 1.0) * 2.0 - 1.0; // range -1..1
+
   void _initGrid(int visibleRows) {
     _visibleRows = visibleRows;
     final total = _total;
-    // Seeded random for reproducible color palette
-    final colorRng = Random(_colorSeed);
+    final s = _colorSeed.toDouble();
 
     _glow = List.filled(total, 0.0);
     _glowTarget = List.filled(total, 0.0);
@@ -359,34 +370,34 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
     _audioHue = List.filled(total, 0.0);
     _audioHueTarget = List.filled(total, 0.0);
     _audioHueNext = List.filled(total, 0.0);
-    _hueOffsets = List.generate(total, (_) => colorRng.nextDouble() * 60 - 30);
-    _brightOffsets =
-        List.generate(total, (_) => colorRng.nextDouble() * 0.3 - 0.15);
+    // Hue/brightness offsets derived from cell position, not RNG
+    _hueOffsets = List.generate(total, (i) => _cellHash(i, s) * 30);
+    _brightOffsets = List.generate(total, (i) => _cellHash(i, s + 7) * 0.15);
     _wobblePhaseX = List.generate(total, (i) => (i * 2.3987) % (2 * pi));
     _wobblePhaseY = List.generate(total, (i) => (i * 3.7141) % (2 * pi));
     _wobbleSpeed = List.generate(total, (i) => 0.3 + ((i * 1.6183) % 1.0) * 0.7);
-    _sizeJitter = List.generate(total, (_) => 0.85 + colorRng.nextDouble() * 0.15);
+    _sizeJitter = List.generate(total, (i) => 0.90 + _cellHash(i, s + 13).abs() * 0.10);
     _cellOffsetX = List.filled(total, 0.0);
     _cellOffsetY = List.filled(total, 0.0);
     _cellVelX = List.filled(total, 0.0);
     _cellVelY = List.filled(total, 0.0);
     _beatForceX = List.filled(total, 0.0);
     _beatForceY = List.filled(total, 0.0);
-    _cellMass = List.generate(total, (_) => colorRng.nextDouble() * 20.0 + 200.0 );
+    _cellMass = List.generate(total, (i) => 200.0 + _cellHash(i, s + 19).abs() * 20.0);
 
-    // Back layer
-    final backRng = Random(_colorSeed + 1);
-    _backHueOffsets = List.generate(total, (_) => backRng.nextDouble() * 60 - 30);
-    _backBrightOffsets = List.generate(total, (_) => backRng.nextDouble() * 0.3 - 0.15);
+    // Back layer — offset seed by 1 for different distribution
+    final sb = s + 1;
+    _backHueOffsets = List.generate(total, (i) => _cellHash(i + total, sb) * 30);
+    _backBrightOffsets = List.generate(total, (i) => _cellHash(i + total, sb + 7) * 0.15);
     _backWobblePhaseX = List.generate(total, (i) => ((i + total) * 2.3987) % (2 * pi));
     _backWobblePhaseY = List.generate(total, (i) => ((i + total) * 3.7141) % (2 * pi));
     _backWobbleSpeed = List.generate(total, (i) => 0.3 + (((i + total) * 1.6183) % 1.0) * 0.7);
-    _backSizeJitter = List.generate(total, (_) => 0.85 + backRng.nextDouble() * 0.15);
+    _backSizeJitter = List.generate(total, (i) => 0.90 + _cellHash(i + total, sb + 13).abs() * 0.10);
     _backCellOffsetX = List.filled(total, 0.0);
     _backCellOffsetY = List.filled(total, 0.0);
     _backCellVelX = List.filled(total, 0.0);
     _backCellVelY = List.filled(total, 0.0);
-    _backCellMass = List.generate(total, (_) => backRng.nextDouble() * 20.0 + 80.0);
+    _backCellMass = List.generate(total, (i) => 80.0 + _cellHash(i + total, sb + 19).abs() * 20.0);
     _backBeatForceX = List.filled(total, 0.0);
     _backBeatForceY = List.filled(total, 0.0);
     _gridInitialized = true;
@@ -394,22 +405,29 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
 
   void _shuffleColors() {
     final total = _total;
-    final colorRng = Random(_colorSeed);
-    _hueOffsets = List.generate(total, (_) => colorRng.nextDouble() * 60 - 30);
-    _brightOffsets =
-        List.generate(total, (_) => colorRng.nextDouble() * 0.3 - 0.15);
+    final s = _colorSeed.toDouble();
+    _hueOffsets = List.generate(total, (i) => _cellHash(i, s) * 30);
+    _brightOffsets = List.generate(total, (i) => _cellHash(i, s + 7) * 0.15);
   }
 
   void _startColorSweep() {
     _nextColorSeed = DateTime.now().millisecondsSinceEpoch;
-    _nextHueAnchor = Random(_nextColorSeed).nextDouble() * 360;
+    // Derive next hue from spectral centroid — what you hear determines the color
+    double centroid = 0, totalE = 0;
+    for (var b = 0; b < 8; b++) {
+      final e = _analyzer.bandEnergy(b);
+      centroid += b * e;
+      totalE += e;
+    }
+    if (totalE > 0) centroid /= totalE;
+    _nextHueAnchor = (centroid / 7.0 * 360) % 360;
     final total = _total;
-    final colorRng = Random(_nextColorSeed);
-    _nextHueOffsets = List.generate(total, (_) => colorRng.nextDouble() * 60 - 30);
-    _nextBrightOffsets = List.generate(total, (_) => colorRng.nextDouble() * 0.3 - 0.15);
+    final s = _nextColorSeed.toDouble();
+    _nextHueOffsets = List.generate(total, (i) => _cellHash(i, s) * 30);
+    _nextBrightOffsets = List.generate(total, (i) => _cellHash(i, s + 7) * 0.15);
     _colorSweepActive = true;
     _colorSweepPhase = -4.0;
-    _colorSweepPattern = (_nextColorSeed ~/ 7) % _patternCount;
+    _colorSweepPattern = _analyzer.dominantBand % _patternCount;
   }
 
   void _advanceColorSweep() {
@@ -584,9 +602,6 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
         final force = sqrt((energy * 100 * quietBoost).clamp(0.0, 4.0));
         final bandHue = (soundHue + b * 30) % 360;
 
-        final waveSeed = nowMs + b;
-        final patRng = Random(waveSeed);
-
         int originC = ((b / 7.0) * (_cols - 1)).round().clamp(0, _cols - 1);
         int originR = ((energy * 5000).clamp(0.0, 1.0) * (_rows - 1)).round().clamp(0, _rows - 1);
 
@@ -623,7 +638,7 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
           patternForce = force * 0.6;
         }
 
-        final path = _generatePath(pattern, originR, originC, patRng);
+        final path = _generatePath(pattern, originR, originC, b, energy);
       }
     }
 
@@ -973,7 +988,9 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
   void _onTap(Offset position) {
     if (!_gridInitialized) return;
     _idleTicks = 0;
-    final cellSize = MediaQuery.of(context).size.width / _visibleCols;
+    final size = MediaQuery.of(context).size;
+    final shortSide = size.width < size.height ? size.width : size.height;
+    final cellSize = shortSide / _portraitCols;
     final tapCol = (position.dx / cellSize).floor() + _extraCols;
     final tapRow = (position.dy / cellSize).floor() + _extraRows;
     if (tapCol < 0 || tapCol >= _cols || tapRow < 0 || tapRow >= _rows) return;
@@ -987,10 +1004,10 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
 
     // Also spawn an audio wave pattern for extra visual punch
     final tapSeed = tapCol * _rows + tapRow + DateTime.now().millisecondsSinceEpoch;
-    final rng = Random(tapSeed);
     final patterns = [_WavePattern.shockwave];
     final pattern = patterns[tapSeed % patterns.length];
-    final path = _generatePath(pattern, tapRow, tapCol, rng);
+    // Tap uses dominant band + current loudness for path shape
+    final path = _generatePath(pattern, tapRow, tapCol, _analyzer.dominantBand, _analyzer.rms);
     _audioWaves.add(_AudioWave(
       intensity: 0.8,
       hue: tapHue,
@@ -1085,24 +1102,29 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
     _tapRipples.removeWhere((r) => r.phase > min(r.maxRadius + 20, (_rows + _cols).toDouble()));
   }
 
-  // Generate a path of [row, col] cells for pattern-based waves
-  List<List<int>> _generatePath(_WavePattern pattern, int startR, int startC, Random rng) {
+  // Generate a path of [row, col] cells for pattern-based waves.
+  // Direction and size are driven by audio band index and energy, not RNG.
+  List<List<int>> _generatePath(_WavePattern pattern, int startR, int startC, int band, double energy) {
     final path = <List<int>>[];
     var r = startR.clamp(0, _rows - 1);
     var c = startC.clamp(0, _cols - 1);
+    // Deterministic direction from band: low bands push down-right, high bands up-left
+    final dirR = band < 4 ? 1 : -1;
+    final dirC = band.isEven ? 1 : -1;
+    // Energy controls size/length of patterns
+    final energyNorm = (energy * 5000).clamp(0.0, 1.0);
 
     switch (pattern) {
       case _WavePattern.snake:
-        // Random walk that prefers a direction (glider-like diagonal movement)
-        final dirR = rng.nextBool() ? 1 : -1;
-        final dirC = rng.nextBool() ? 1 : -1;
-        for (var step = 0; step < 40; step++) {
+        // Diagonal glider — direction from band, length from energy
+        final steps = 15 + (energyNorm * 25).round();
+        for (var step = 0; step < steps; step++) {
           path.add([r, c]);
-          // Glider-like: mostly diagonal, occasionally straight
-          if (rng.nextDouble() < 0.7) {
+          // Mostly diagonal, occasionally straight — ratio from energy
+          if (step % 5 < 3) {
             r += dirR;
             c += dirC;
-          } else if (rng.nextBool()) {
+          } else if (step.isEven) {
             r += dirR;
           } else {
             c += dirC;
@@ -1113,18 +1135,19 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
         break;
 
       case _WavePattern.grow:
-        // Flood-fill like growth from center — BFS order
+        // BFS growth — size proportional to energy, deterministic order
         final visited = <int>{};
         final queue = <List<int>>[[r, c]];
-        while (queue.isNotEmpty && path.length < 20) {
-          final idx = rng.nextInt(queue.length);
-          final cell = queue.removeAt(idx);
+        final maxCells = 8 + (energyNorm * 16).round();
+        while (queue.isNotEmpty && path.length < maxCells) {
+          // Always take from front (deterministic BFS, not random)
+          final cell = queue.removeAt(0);
           final key = cell[0] * _cols + cell[1];
           if (visited.contains(key)) continue;
           visited.add(key);
           path.add(cell);
-          // Add neighbors in random order
-          for (final d in [[-1,0],[1,0],[0,-1],[0,1]]..shuffle(rng)) {
+          // Cardinal neighbors in fixed order
+          for (final d in [[-1,0],[0,1],[1,0],[0,-1]]) {
             final nr = cell[0] + d[0];
             final nc = cell[1] + d[1];
             if (nr >= 0 && nr < _rows && nc >= 0 && nc < _cols) {
@@ -1135,23 +1158,22 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
         break;
 
       case _WavePattern.tetris:
-        // Small connected shapes (3-5 cells) that glide diagonally
-        // First generate a small tetromino-like shape
+        // Shape size from energy (2-5 cells), direction from band
+        final shapeCells = 2 + (energyNorm * 3).round();
         final shape = <List<int>>[[0, 0]];
-        for (var i = 0; i < 3 + rng.nextInt(3); i++) {
-          final base = shape[rng.nextInt(shape.length)];
-          final dirs = [[-1,0],[1,0],[0,-1],[0,1]];
-          final d = dirs[rng.nextInt(4)];
+        final dirs = [[-1,0],[0,1],[1,0],[0,-1]];
+        for (var i = 0; i < shapeCells; i++) {
+          final base = shape[i % shape.length];
+          final d = dirs[i % 4];
           final nr = base[0] + d[0];
           final nc = base[1] + d[1];
           if (!shape.any((s) => s[0] == nr && s[1] == nc)) {
             shape.add([nr, nc]);
           }
         }
-        // Now glide the shape diagonally across the grid
-        final dR = rng.nextBool() ? 1 : -1;
-        final dC = rng.nextBool() ? 1 : -1;
-        for (var step = 0; step < 30; step++) {
+        // Glide diagonally — direction from band
+        final steps = 10 + (energyNorm * 20).round();
+        for (var step = 0; step < steps; step++) {
           for (final s in shape) {
             final pr = r + s[0];
             final pc = c + s[1];
@@ -1159,8 +1181,8 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
               path.add([pr, pc]);
             }
           }
-          r += dR;
-          c += dC;
+          r += dirR;
+          c += dirC;
           r = r.clamp(0, _rows - 1);
           c = c.clamp(0, _cols - 1);
         }
@@ -1181,26 +1203,24 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
 
       case _WavePattern.shockwave:
         // Concentric diamond rings expanding outward (manhattan distance)
+        // No shuffle — deterministic ring order
         for (var ring = 0; ring < (_rows + _cols) ~/ 2; ring++) {
-          final cells = <List<int>>[];
           for (var dr = -ring; dr <= ring; dr++) {
             final dc = ring - dr.abs();
             for (final d in [dc, -dc]) {
               final sr = startR + dr;
               final sc = startC + d;
               if (sr >= 0 && sr < _rows && sc >= 0 && sc < _cols) {
-                cells.add([sr, sc]);
+                path.add([sr, sc]);
               }
             }
           }
-          cells.shuffle(rng);
-          path.addAll(cells);
         }
         break;
 
       case _WavePattern.rain:
-        // Vertical columns dropping down from origin row
-        final width = 2 + rng.nextInt(4);
+        // Vertical columns — width proportional to energy
+        final width = 1 + (energyNorm * 5).round();
         final startCol = (startC - width ~/ 2).clamp(0, _cols - 1);
         final endCol = (startC + width ~/ 2).clamp(0, _cols - 1);
         for (var row = startR; row < _rows; row++) {
@@ -1386,10 +1406,15 @@ class _AccelerometerColorScreenState extends State<AccelerometerColorScreen>
             onTapDown: (details) => _onTap(details.localPosition),
             child: LayoutBuilder(
               builder: (context, constraints) {
-                final cellSize = constraints.maxWidth / _visibleCols;
-              final neededRows = (constraints.maxHeight / cellSize).ceil();
-              if (neededRows != _visibleRows) {
+                final shortSide = constraints.maxWidth < constraints.maxHeight
+                    ? constraints.maxWidth
+                    : constraints.maxHeight;
+                final cellSize = shortSide / _portraitCols;
+                final neededCols = (constraints.maxWidth / cellSize).ceil();
+                final neededRows = (constraints.maxHeight / cellSize).ceil();
+              if (neededCols != _visibleCols || neededRows != _visibleRows) {
                 WidgetsBinding.instance.addPostFrameCallback((_) {
+                  _visibleCols = neededCols;
                   _initGrid(neededRows);
                 });
               }
